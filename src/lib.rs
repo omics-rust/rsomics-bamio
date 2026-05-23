@@ -30,7 +30,10 @@ use std::path::Path;
 use noodles::{bam, bgzf};
 use rsomics_common::{Result, RsomicsError};
 
+pub mod batch;
 pub mod raw;
+
+pub use batch::BatchBamWriter;
 
 /// Buffer the file under the single-threaded BGZF reader so the per-block frame
 /// reads coalesce into one ~256 KiB refill instead of two syscalls per block.

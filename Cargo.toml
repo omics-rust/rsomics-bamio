@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bamio"
-version = "0.1.8"
+version = "0.1.9"
 description = "Parallel-BGZF BAM reader/writer + raw-record edit shared by the rsomics-bam-* tool family. Layer A primitive."
 edition = "2024"
 rust-version = "1.91"
@@ -21,6 +21,10 @@ noodles = { version = "0.110", features = ["sam", "bam", "bgzf"] }
 # noodles meta-crate doesn't pass the feature through) — Cargo unifies it onto
 # the same noodles-bgzf the meta pulls in. Portable bundled C, no system lib.
 noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
+# The batch writer's framing thread takes record batches off a bounded channel.
+# This is the same crossbeam-channel noodles-bgzf's MultithreadedWriter already
+# uses internally, so Cargo unifies it onto one copy.
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

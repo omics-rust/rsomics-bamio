@@ -23,7 +23,7 @@
 //! is sufficient for every consumer of this crate.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::num::NonZero;
 use std::path::Path;
 
@@ -41,9 +41,12 @@ const READ_BUFFER: usize = 256 * 1024;
 /// The inner BGZF reader is type-erased: at `workers == 1` it is the plain
 /// single-threaded reader (libdeflate, no channel overhead); at `workers >= 2`
 /// it inflates blocks across a worker pool. Both are boxed as
-/// `Box<dyn Read + Send>`, so this stays one concrete type and the `rsomics-bam-*`
-/// tools can pass it to a generic `bam::io::Reader<R>` consumer unchanged.
-pub type ParallelBamReader = bam::io::Reader<Box<dyn Read + Send>>;
+/// `Box<dyn BufRead + Send>` — `BufRead` (not just `Read`) so the zero-copy
+/// [`raw::RecordReader`] can borrow record bytes straight out of the inflated
+/// block buffer via `reader.get_mut()`. `BufRead: Read`, so this stays one
+/// concrete type and every existing `Read`-based consumer (`read_record`,
+/// `bam::io::Reader<R>`) keeps working unchanged.
+pub type ParallelBamReader = bam::io::Reader<Box<dyn BufRead + Send>>;
 
 /// A BAM writer whose BGZF blocks are deflated across a worker pool. Even at one
 /// worker the pool wins, because the deflate thread overlaps the caller's
@@ -63,7 +66,7 @@ pub fn open_parallel(input: &Path) -> Result<ParallelBamReader> {
 pub fn open_with_workers(input: &Path, workers: NonZero<usize>) -> Result<ParallelBamReader> {
     let file = File::open(input)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", input.display())))?;
-    let inner: Box<dyn Read + Send> = if workers.get() == 1 {
+    let inner: Box<dyn BufRead + Send> = if workers.get() == 1 {
         let buffered = BufReader::with_capacity(READ_BUFFER, file);
         Box::new(bgzf::io::Reader::new(buffered))
     } else {

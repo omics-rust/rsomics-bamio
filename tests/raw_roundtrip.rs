@@ -1,7 +1,7 @@
 use std::num::NonZero;
 use std::path::Path;
 
-use rsomics_bamio::raw::{self, FLAG_DUPLICATE, RawRecord};
+use rsomics_bamio::raw::{self, FLAG_DUPLICATE, RawRecord, RecordReader};
 
 fn fixture() -> &'static Path {
     Path::new(concat!(
@@ -119,6 +119,91 @@ fn clear_flag_bits_only_touches_target_bits() {
     r.clear_flag_bits(FLAG_DUPLICATE);
     assert_eq!(r.flags(), before & !FLAG_DUPLICATE);
     assert_eq!(r.flags() & FLAG_DUPLICATE, 0);
+}
+
+/// The borrowing `RecordReader` must decode every field byte-identically to the
+/// owning `read_record` path over the same stream, at both worker counts (single
+/// = plain reader, multi = worker pool). This is the correctness contract the
+/// 13+ dependent tools rely on when they switch to the zero-copy scan.
+#[test]
+fn borrowed_reader_matches_owned_read() {
+    for workers in [1usize, 4] {
+        let nz = NonZero::new(workers).unwrap();
+
+        let owned: Vec<RawRecord> = {
+            let mut reader = rsomics_bamio::open_with_workers(fixture(), nz).unwrap();
+            reader.read_header().unwrap();
+            let mut out = Vec::new();
+            let mut rec = RawRecord::default();
+            while raw::read_record(reader.get_mut(), &mut rec).unwrap() != 0 {
+                out.push(rec.clone());
+            }
+            out
+        };
+
+        let mut reader = rsomics_bamio::open_with_workers(fixture(), nz).unwrap();
+        reader.read_header().unwrap();
+        let mut scanner = RecordReader::new(reader.get_mut());
+        let mut i = 0;
+        while let Some(r) = scanner.next().unwrap() {
+            let o = &owned[i];
+            assert_eq!(r.as_bytes(), o.as_bytes(), "workers={workers} record {i}");
+            assert_eq!(r.flags(), o.flags());
+            assert_eq!(r.reference_sequence_id(), o.reference_sequence_id());
+            assert_eq!(r.alignment_start(), o.alignment_start());
+            assert_eq!(r.mapping_quality(), o.mapping_quality());
+            assert_eq!(r.name(), o.name());
+            assert_eq!(
+                r.cigar_ops().collect::<Vec<_>>(),
+                o.cigar_ops().collect::<Vec<_>>()
+            );
+            assert_eq!(r.sequence_len(), o.sequence_len());
+            assert_eq!(r.quality_scores(), o.quality_scores());
+            i += 1;
+        }
+        assert_eq!(i, owned.len(), "workers={workers}: record count");
+    }
+}
+
+/// Exercise the block-straddling spill branch: a file large enough to span many
+/// BGZF blocks puts some records across a block boundary, where `RecordReader`
+/// must copy into its scratch buffer instead of borrowing. The borrowed scan must
+/// still reproduce every owned record byte-for-byte.
+#[test]
+fn borrowed_reader_handles_multi_block_files() {
+    let (originals, header) = read_all(fixture());
+
+    // Repeat the golden records until the encoded file spans several 64 KiB BGZF
+    // blocks, forcing at least one record to straddle a boundary.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    {
+        let mut writer =
+            rsomics_bamio::create_with_workers(tmp.path(), NonZero::new(1).unwrap()).unwrap();
+        use noodles::sam::alignment::io::Write as _;
+        writer.write_alignment_header(&header).unwrap();
+        for _ in 0..5000 {
+            for r in &originals {
+                raw::write_record(writer.get_mut(), r).unwrap();
+            }
+        }
+    }
+
+    let owned = {
+        let (recs, _) = read_all(tmp.path());
+        recs
+    };
+    assert_eq!(owned.len(), originals.len() * 5000);
+
+    let mut reader =
+        rsomics_bamio::open_with_workers(tmp.path(), NonZero::new(1).unwrap()).unwrap();
+    reader.read_header().unwrap();
+    let mut scanner = RecordReader::new(reader.get_mut());
+    let mut i = 0;
+    while let Some(r) = scanner.next().unwrap() {
+        assert_eq!(r.as_bytes(), owned[i].as_bytes(), "record {i}");
+        i += 1;
+    }
+    assert_eq!(i, owned.len());
 }
 
 #[test]

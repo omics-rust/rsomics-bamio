@@ -1,12 +1,29 @@
-//! Shared BAM input for the `rsomics-bam-*` tools.
+//! Shared BAM input/output for the `rsomics-bam-*` tools.
 //!
-//! samtools inflates BGZF on a single thread by default, and a single-threaded
-//! pure-Rust reader (zlib-rs) loses to its libdeflate inner loop. Inflating
-//! BGZF blocks across a worker pool is the lever that puts our reader ahead of
-//! `samtools` default invocations on multi-core hosts, so every BAM tool reads
-//! through this one primitive rather than constructing a plain reader.
+//! `samtools` inflates BGZF on a single thread by default, and a single-threaded
+//! pure-Rust reader (zlib-rs) loses to its libdeflate inner loop. The lever that
+//! wins is libdeflate on every block (enabled here) plus the right threading
+//! shape for each direction:
+//!
+//! - **Reader**: at one worker, noodles' `MultithreadedReader` is pure overhead
+//!   — a crossbeam channel per block and a cross-thread hand-off at `bounded(1)`,
+//!   with no main-thread work to overlap the lone inflate worker against. So
+//!   `workers == 1` routes through the plain `bgzf::io::Reader`, which beats
+//!   samtools single-threaded on libdeflate alone; `workers >= 2` uses the pool.
+//!   Both inner readers are erased behind `Box<dyn Read + Send>`, so the public
+//!   `ParallelBamReader` stays one concrete type. The dyn dispatch is one vtable
+//!   hop per BGZF block (~64 KiB), not per byte — negligible against inflate.
+//! - **Writer**: the worker-pool writer wins even at one worker, because the
+//!   deflate thread overlaps the caller's read+decode on the main thread (BGZF
+//!   compression dominates a write-out). So file output always uses the pool.
+//!
+//! The reader is forward-only: BAM tools that need index-driven seeks (region
+//! queries, `bedcov`) build their own seekable `bam::io::Reader<File>` directly,
+//! which was never this primitive's job. So `Box<dyn Read + Send>` (no `Seek`)
+//! is sufficient for every consumer of this crate.
 
 use std::fs::File;
+use std::io::{BufReader, Read};
 use std::num::NonZero;
 use std::path::Path;
 
@@ -15,10 +32,22 @@ use rsomics_common::{Result, RsomicsError};
 
 pub mod raw;
 
-/// A BAM reader whose BGZF blocks are inflated across a worker pool.
-pub type ParallelBamReader = bam::io::Reader<bgzf::io::MultithreadedReader<File>>;
+/// Buffer the file under the single-threaded BGZF reader so the per-block frame
+/// reads coalesce into one ~256 KiB refill instead of two syscalls per block.
+const READ_BUFFER: usize = 256 * 1024;
 
-/// A BAM writer whose BGZF blocks are deflated across a worker pool.
+/// A BAM reader over a BGZF stream, forward-only.
+///
+/// The inner BGZF reader is type-erased: at `workers == 1` it is the plain
+/// single-threaded reader (libdeflate, no channel overhead); at `workers >= 2`
+/// it inflates blocks across a worker pool. Both are boxed as
+/// `Box<dyn Read + Send>`, so this stays one concrete type and the `rsomics-bam-*`
+/// tools can pass it to a generic `bam::io::Reader<R>` consumer unchanged.
+pub type ParallelBamReader = bam::io::Reader<Box<dyn Read + Send>>;
+
+/// A BAM writer whose BGZF blocks are deflated across a worker pool. Even at one
+/// worker the pool wins, because the deflate thread overlaps the caller's
+/// read+decode (see [`create_with_workers`]).
 pub type ParallelBamWriter = bam::io::Writer<bgzf::io::MultithreadedWriter<File>>;
 
 /// Open `input` with one inflate worker per available core.
@@ -27,13 +56,22 @@ pub fn open_parallel(input: &Path) -> Result<ParallelBamReader> {
     open_with_workers(input, workers)
 }
 
-/// Open `input` with an explicit worker count (1 = effectively single-threaded).
+/// Open `input` with an explicit worker count. `workers == 1` uses the plain
+/// single-threaded reader (no channel overhead); `workers >= 2` inflates blocks
+/// across a worker pool. The inner reader is boxed as `Box<dyn Read + Send>`, so
+/// both cases share one return type.
 pub fn open_with_workers(input: &Path, workers: NonZero<usize>) -> Result<ParallelBamReader> {
     let file = File::open(input)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", input.display())))?;
-    Ok(bam::io::Reader::from(
-        bgzf::io::MultithreadedReader::with_worker_count(workers, file),
-    ))
+    let inner: Box<dyn Read + Send> = if workers.get() == 1 {
+        let buffered = BufReader::with_capacity(READ_BUFFER, file);
+        Box::new(bgzf::io::Reader::new(buffered))
+    } else {
+        Box::new(bgzf::io::MultithreadedReader::with_worker_count(
+            workers, file,
+        ))
+    };
+    Ok(bam::io::Reader::from(inner))
 }
 
 /// Create `output` with one deflate worker per available core. The BGZF EOF
@@ -43,7 +81,12 @@ pub fn create_parallel(output: &Path) -> Result<ParallelBamWriter> {
     create_with_workers(output, workers)
 }
 
-/// Create `output` with an explicit deflate worker count.
+/// Create `output` with an explicit deflate worker count. Even at `workers == 1`
+/// this uses the worker-pool writer: deflate runs on the worker thread while the
+/// caller's read+decode runs on the main thread, so the two pipeline-overlap.
+/// (The reader's worker pool, by contrast, is pure overhead at one worker — see
+/// [`open_with_workers`] — because there is no main-thread work to overlap with
+/// a single inflate worker.) The BGZF EOF block is appended on drop.
 pub fn create_with_workers(output: &Path, workers: NonZero<usize>) -> Result<ParallelBamWriter> {
     let file = File::create(output)
         .map_err(|e| RsomicsError::InvalidInput(format!("creating {}: {e}", output.display())))?;

@@ -145,6 +145,26 @@ impl RawRecord {
         FIXED_HEAD + self.name_len() + self.cigar_op_count() * 4 + self.base_count().div_ceil(2)
     }
 
+    /// Number of query bases (`l_seq`, offset 16). This is the SEQ/QUAL length,
+    /// not the byte length of either packed field.
+    pub fn sequence_len(&self) -> usize {
+        self.base_count()
+    }
+
+    /// The 4-bit `seq_nt16` code (0..=15) of the query base at 0-based index `i`,
+    /// read straight from the packed SEQ nibbles (high nibble = even index). The
+    /// pileup base encoding maps this through `seq_nt16_str` (`=ACMGRSVTWYHKDBN`),
+    /// so the engine carries the raw code rather than a decoded byte.
+    pub fn seq_nibble(&self, i: usize) -> u8 {
+        let seq_start = FIXED_HEAD + self.name_len() + self.cigar_op_count() * 4;
+        let byte = self.bytes[seq_start + i / 2];
+        if i.is_multiple_of(2) {
+            byte >> 4
+        } else {
+            byte & 0x0f
+        }
+    }
+
     /// Per-base quality scores (Phred, not ASCII-offset). A fully-`0xff` block
     /// (the BAM "missing qualities" sentinel) yields an empty slice.
     pub fn quality_scores(&self) -> &[u8] {
@@ -156,6 +176,18 @@ impl RawRecord {
         } else {
             qual
         }
+    }
+
+    /// Mutable per-base quality scores. The pileup overlap-removal step zeroes /
+    /// scales qualities of overlapping mate bases in place (htslib
+    /// `tweak_overlap_quality`), so it needs to write back into the raw payload.
+    /// Unlike [`quality_scores`](Self::quality_scores) this does not mask the
+    /// `0xff` "missing" sentinel — callers check `sequence_len` and the sentinel
+    /// themselves before mutating.
+    pub fn quality_scores_mut(&mut self) -> &mut [u8] {
+        let base_count = self.base_count();
+        let start = self.quality_start();
+        &mut self.bytes[start..start + base_count]
     }
 
     fn aux_start(&self) -> usize {

@@ -297,6 +297,18 @@ impl RawRecord {
         &mut self.bytes[start..start + base_count]
     }
 
+    /// Mutable packed SEQ nibbles. The calmd `use_equal` path rewrites matched
+    /// base nibbles to 0 (the `=` code in `seq_nt16`) in place. The packed
+    /// representation stores two bases per byte: high nibble = even index, low
+    /// nibble = odd index. The returned slice is `(seq_len + 1) / 2` bytes.
+    pub fn seq_bytes_mut(&mut self) -> &mut [u8] {
+        let base_count = payload_base_count(&self.bytes);
+        let start =
+            FIXED_HEAD + payload_name_len(&self.bytes) + payload_cigar_op_count(&self.bytes) * 4;
+        let end = start + base_count.div_ceil(2);
+        &mut self.bytes[start..end]
+    }
+
     /// Set the given FLAG bits (offset 14). Other bits are left untouched.
     pub fn set_flag_bits(&mut self, bits: u16) {
         let new = self.flags() | bits;

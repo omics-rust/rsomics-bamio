@@ -13,6 +13,8 @@ use std::path::Path;
 use noodles::{bam, bgzf};
 use rsomics_common::{Result, RsomicsError};
 
+pub mod raw;
+
 /// A BAM reader whose BGZF blocks are inflated across a worker pool.
 pub type ParallelBamReader = bam::io::Reader<bgzf::io::MultithreadedReader<File>>;
 

@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bamio"
-version = "0.1.9"
+version = "0.1.10"
 description = "Parallel-BGZF BAM reader/writer + raw-record edit shared by the rsomics-bam-* tool family. Layer A primitive."
 edition = "2024"
 rust-version = "1.91"
@@ -25,6 +25,12 @@ noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 # This is the same crossbeam-channel noodles-bgzf's MultithreadedWriter already
 # uses internally, so Cargo unifies it onto one copy.
 crossbeam-channel = "0.5"
+# Quadrant ② (FFI): libdeflate via the libdeflater Rust bindings. Used by
+# WorkStealingBgzfWriter to compress BGZF blocks with no per-block allocator
+# overhead — the same library samtools' bgzf_mt uses, at level 6. noodles-bgzf
+# already brings in libdeflate-sys transitively (when the `libdeflate` feature
+# is active); this declaration adds the Rust API surface.
+libdeflater = "1"
 
 [dev-dependencies]
 tempfile = "3"

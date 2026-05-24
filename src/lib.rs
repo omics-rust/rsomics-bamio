@@ -31,9 +31,11 @@ use noodles::{bam, bgzf};
 use rsomics_common::{Result, RsomicsError};
 
 pub mod batch;
+pub mod par_writer;
 pub mod raw;
 
-pub use batch::BatchBamWriter;
+pub use batch::{BatchBamWriter, WsBatchBamWriter};
+pub use par_writer::{WorkStealingBgzfWriter, create_ws_bgzf};
 
 /// Buffer the file under the single-threaded BGZF reader so the per-block frame
 /// reads coalesce into one ~256 KiB refill instead of two syscalls per block.
@@ -55,6 +57,11 @@ pub type ParallelBamReader = bam::io::Reader<Box<dyn BufRead + Send>>;
 /// worker the pool wins, because the deflate thread overlaps the caller's
 /// read+decode (see [`create_with_workers`]).
 pub type ParallelBamWriter = bam::io::Writer<bgzf::io::MultithreadedWriter<File>>;
+
+/// A BAM writer backed by the work-stealing BGZF writer. At `workers >= 2` this
+/// eliminates noodles' per-block channel allocation and matches samtools'
+/// fixed-ring bgzf_mt design. Use [`create_ws_bam_writer`] to construct.
+pub type WsBamWriter = bam::io::Writer<WorkStealingBgzfWriter<File>>;
 
 /// Open `input` with one inflate worker per available core.
 pub fn open_parallel(input: &Path) -> Result<ParallelBamReader> {
@@ -99,4 +106,24 @@ pub fn create_with_workers(output: &Path, workers: NonZero<usize>) -> Result<Par
     Ok(bam::io::Writer::from(
         bgzf::io::MultithreadedWriter::with_worker_count(workers, file),
     ))
+}
+
+/// Create `output` backed by the work-stealing BGZF writer with `workers`
+/// deflate threads. At `workers >= 2` this eliminates noodles' per-block channel
+/// allocation, matching samtools' fixed-ring `bgzf_mt` design. The BGZF EOF
+/// block is appended when the writer is finished or dropped.
+pub fn create_ws_with_workers(output: &Path, workers: NonZero<usize>) -> Result<WsBamWriter> {
+    let file = File::create(output)
+        .map_err(|e| RsomicsError::InvalidInput(format!("creating {}: {e}", output.display())))?;
+    Ok(bam::io::Writer::from(WorkStealingBgzfWriter::new(
+        file, workers,
+    )))
+}
+
+/// Finish a [`WsBamWriter`], flushing pending BGZF blocks and appending the EOF
+/// marker. This is a free function rather than a method because the `WsBamWriter`
+/// type alias wraps `bam::io::Writer<WorkStealingBgzfWriter<File>>` and the
+/// inner `WorkStealingBgzfWriter::finish` method consumes the inner writer.
+pub fn finish_ws_bam_writer(writer: WsBamWriter) -> Result<()> {
+    writer.into_inner().finish().map_err(RsomicsError::Io)
 }

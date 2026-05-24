@@ -34,8 +34,8 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Sender, bounded};
 use rsomics_common::{Result, RsomicsError};
 
-use crate::ParallelBamWriter;
 use crate::raw::RawRecord;
+use crate::{ParallelBamWriter, WsBamWriter, finish_ws_bam_writer};
 
 /// Bounded depth of the batch channel. Two in-flight batches let the framing
 /// thread work on one while the producer assembles the next, without letting an
@@ -136,6 +136,87 @@ fn frame_loop(
     mut writer: ParallelBamWriter,
     receiver: crossbeam_channel::Receiver<Batch>,
 ) -> Result<ParallelBamWriter> {
+    let inner = writer.get_mut();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Ok(batch) = receiver.recv() {
+        buf.clear();
+        for record in &batch {
+            let payload = record.as_bytes();
+            let block_size = u32::try_from(payload.len())
+                .map_err(|e| RsomicsError::InvalidInput(format!("record too large: {e}")))?;
+            buf.extend_from_slice(&block_size.to_le_bytes());
+            buf.extend_from_slice(payload);
+        }
+        inner.write_all(&buf).map_err(RsomicsError::Io)?;
+    }
+    Ok(writer)
+}
+
+/// A batched BAM writer backed by the work-stealing BGZF writer.
+///
+/// Drop-in replacement for [`BatchBamWriter`] for use with a [`WsBamWriter`].
+/// The framing logic is identical — batch concatenation on a dedicated thread,
+/// BGZF block management on the WS deflate pool — but the underlying BGZF
+/// compressor is the fixed-ring work-stealing writer rather than noodles'
+/// per-block-channel `MultithreadedWriter`.
+///
+/// Construct from a [`WsBamWriter`] whose header has already been written.
+/// Call [`finish`](Self::finish) at the end to flush and propagate any error.
+pub struct WsBatchBamWriter {
+    sender: Option<Sender<Batch>>,
+    handle: Option<JoinHandle<Result<WsBamWriter>>>,
+}
+
+impl WsBatchBamWriter {
+    /// Wrap a [`WsBamWriter`] (header already written) for batched writes.
+    pub fn new(writer: WsBamWriter) -> Self {
+        let (sender, receiver) = bounded::<Batch>(CHANNEL_DEPTH);
+        let handle = std::thread::spawn(move || ws_frame_loop(writer, receiver));
+        WsBatchBamWriter {
+            sender: Some(sender),
+            handle: Some(handle),
+        }
+    }
+
+    /// Hand a batch of records to the framing thread. Same semantics as
+    /// [`BatchBamWriter::write_records_batch`].
+    pub fn write_records_batch(&mut self, batch: Vec<RawRecord>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .expect("write_records_batch after finish");
+        sender.send(batch).ok();
+        Ok(())
+    }
+
+    /// Flush, append the BGZF EOF block, and surface any write error.
+    pub fn finish(mut self) -> Result<()> {
+        drop(self.sender.take());
+        let handle = self.handle.take().expect("finish called twice");
+        let writer = handle.join().expect("WS framing thread panicked")?;
+        finish_ws_bam_writer(writer)
+    }
+}
+
+impl Drop for WsBatchBamWriter {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take()
+            && let Ok(writer) = handle.join().expect("WS framing thread panicked")
+        {
+            let _ = finish_ws_bam_writer(writer);
+        }
+    }
+}
+
+/// Framing-thread body for the WS-backed writer.
+fn ws_frame_loop(
+    mut writer: WsBamWriter,
+    receiver: crossbeam_channel::Receiver<Batch>,
+) -> Result<WsBamWriter> {
     let inner = writer.get_mut();
     let mut buf: Vec<u8> = Vec::new();
     while let Ok(batch) = receiver.recv() {

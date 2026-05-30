@@ -245,6 +245,20 @@ macro_rules! raw_field_accessors {
                 payload_seq_nibble(self.payload_bytes(), i)
             }
 
+            /// The raw packed-nibble SEQ bytes as stored in BAM (2 bases per byte,
+            /// high nibble = base at even query position). Length = `(seq_len+1)/2`.
+            ///
+            /// Prefer this over repeated `seq_nibble` calls in inner loops: it
+            /// computes the sequence start offset once rather than per-call.
+            pub fn seq_bytes_packed(&self) -> &[u8] {
+                let bytes = self.payload_bytes();
+                let seq_start = FIXED_HEAD
+                    + payload_name_len(bytes)
+                    + payload_cigar_op_count(bytes) * 4;
+                let seq_len = payload_base_count(bytes);
+                &bytes[seq_start..seq_start + seq_len.div_ceil(2)]
+            }
+
             /// Per-base quality scores (Phred, not ASCII-offset). A fully-`0xff`
             /// block (the BAM "missing qualities" sentinel) yields an empty slice.
             pub fn quality_scores(&self) -> &[u8] {
@@ -279,6 +293,16 @@ pub struct RawRecord {
 }
 
 raw_field_accessors!(owned RawRecord);
+
+impl From<Vec<u8>> for RawRecord {
+    /// Construct a [`RawRecord`] from a pre-validated payload byte vector.
+    ///
+    /// `bytes` must be the payload of exactly one BAM record (everything after
+    /// the 4-byte `block_size` field). No validation is performed.
+    fn from(bytes: Vec<u8>) -> Self {
+        RawRecord { bytes }
+    }
+}
 
 impl RawRecord {
     fn set_i32_at(&mut self, off: usize, value: i32) {
@@ -379,6 +403,17 @@ impl RawRecord {
         self.remove_aux(tag);
         self.append_aux(tag, type_code, value);
     }
+
+    /// Copy `other`'s bytes into `self`, reusing `self`'s allocation when possible.
+    ///
+    /// Unlike `self.clone_from(other)` (which does the same via the derived
+    /// `Clone` impl), this method is explicitly named to signal intent: the caller
+    /// is recycling a pooled buffer to avoid per-record malloc overhead.
+    #[inline]
+    pub fn clone_from_raw(&mut self, other: &RawRecord) {
+        self.bytes.clear();
+        self.bytes.extend_from_slice(&other.bytes);
+    }
 }
 
 /// Length in bytes of an aux value (excluding the type code) starting at `pos`.
@@ -442,6 +477,15 @@ pub struct RecordRef<'a> {
 raw_field_accessors!(borrowed <'a> RecordRef<'a>);
 
 impl<'a> RecordRef<'a> {
+    /// Construct a borrowing view over a raw BAM record payload slice.
+    ///
+    /// `bytes` must be the payload of exactly one BAM record (everything after
+    /// the 4-byte `block_size` field). No validation is performed; callers that
+    /// read from a slab guarantee this invariant by construction.
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        RecordRef { bytes }
+    }
+
     /// The raw payload bytes with the record's full borrow lifetime `'a`, so the
     /// slice (and slices derived from it) outlive a by-value `RecordRef`. Prefer
     /// this over [`as_bytes`](Self::as_bytes) — whose result is tied to `&self` —

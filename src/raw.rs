@@ -176,42 +176,35 @@ macro_rules! raw_field_accessors {
                 &self.bytes[..]
             }
 
-            /// The raw payload bytes (after `block_size`), as stored on disk.
             pub fn as_bytes(&self) -> &[u8] {
                 self.payload_bytes()
             }
 
-            /// FLAG (offset 14, u16 LE).
             pub fn flags(&self) -> u16 {
                 u16_at(self.payload_bytes(), FLAG)
             }
 
-            /// refID (offset 0, i32 LE; -1 = unmapped/none).
             pub fn reference_sequence_id(&self) -> i32 {
                 i32_at(self.payload_bytes(), REF_ID)
             }
 
-            /// pos (offset 4, i32 LE, 0-based; -1 = none).
+            /// 0-based; -1 = unmapped.
             pub fn alignment_start(&self) -> i32 {
                 i32_at(self.payload_bytes(), POS)
             }
 
-            /// MAPQ (offset 9, u8).
             pub fn mapping_quality(&self) -> u8 {
                 self.payload_bytes()[MAPQ]
             }
 
-            /// next_refID (offset 20, i32 LE).
             pub fn mate_reference_sequence_id(&self) -> i32 {
                 i32_at(self.payload_bytes(), NEXT_REF_ID)
             }
 
-            /// next_pos (offset 24, i32 LE, 0-based).
             pub fn mate_alignment_start(&self) -> i32 {
                 i32_at(self.payload_bytes(), NEXT_POS)
             }
 
-            /// tlen (offset 28, i32 LE).
             pub fn template_length(&self) -> i32 {
                 i32_at(self.payload_bytes(), TLEN)
             }
@@ -345,31 +338,23 @@ impl RawRecord {
         self.bytes[FLAG..FLAG + 2].copy_from_slice(&new.to_le_bytes());
     }
 
-    /// Set refID (offset 0). The unmapped-read salvage step copies a mapped
-    /// mate's reference onto its unmapped partner so a coordinate sort keeps the
-    /// pair adjacent.
+    /// Salvage step: copies mapped mate's refID onto unmapped partner so a coordinate sort keeps the pair adjacent.
     pub fn set_reference_sequence_id(&mut self, value: i32) {
         self.set_i32_at(REF_ID, value);
     }
 
-    /// Set pos (offset 4, 0-based). Paired with
-    /// [`set_reference_sequence_id`](Self::set_reference_sequence_id) for the
-    /// unmapped-read salvage step.
     pub fn set_alignment_start(&mut self, value: i32) {
         self.set_i32_at(POS, value);
     }
 
-    /// Set next_refID (offset 20).
     pub fn set_mate_reference_sequence_id(&mut self, value: i32) {
         self.set_i32_at(NEXT_REF_ID, value);
     }
 
-    /// Set next_pos (offset 24).
     pub fn set_mate_alignment_start(&mut self, value: i32) {
         self.set_i32_at(NEXT_POS, value);
     }
 
-    /// Set tlen (offset 28).
     pub fn set_template_length(&mut self, value: i32) {
         self.set_i32_at(TLEN, value);
     }

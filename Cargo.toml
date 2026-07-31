@@ -1,35 +1,23 @@
 [package]
 name = "rsomics-bamio"
-version = "0.1.10"
-description = "Parallel-BGZF BAM reader/writer + raw-record edit shared by the rsomics-bam-* tool family. Layer A primitive."
+version = "0.2.0"
+description = "Validated raw BAM records and parallel BGZF I/O for rsomics products"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/omics-rust/rsomics-world"
+repository = "https://github.com/omics-rust/rsomics-bamio"
+homepage = "https://github.com/omics-rust/rsomics-bamio"
+documentation = "https://docs.rs/rsomics-bamio"
 authors = ["Zane Leong <efd@live.com>"]
 readme = "README.md"
 categories = ["science"]
 keywords = ["bam", "bgzf", "bioinformatics", "samtools", "reader"]
 
 [dependencies]
-rsomics-common = { version = "0.6" }
+rsomics-common = { version = "0.7" }
 noodles = { version = "0.110", features = ["sam", "bam", "bgzf"] }
-# FFI: bundled-C libdeflate via the noodles-bgzf `libdeflate` feature. This is
-# the inflate/deflate samtools uses; it switches every BGZF block in this
-# crate's reader and writer off zlib-rs onto libdeflate, which wins
-# single-threaded and widens the parallel margin. Declared directly (the
-# noodles meta-crate doesn't pass the feature through) — Cargo unifies it onto
-# the same noodles-bgzf the meta pulls in. Portable bundled C, no system lib.
 noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
-# The batch writer's framing thread takes record batches off a bounded channel.
-# This is the same crossbeam-channel noodles-bgzf's MultithreadedWriter already
-# uses internally, so Cargo unifies it onto one copy.
 crossbeam-channel = "0.5"
-# FFI: libdeflate via the libdeflater Rust bindings. Used by
-# WorkStealingBgzfWriter to compress BGZF blocks with no per-block allocator
-# overhead — the same library samtools' bgzf_mt uses, at level 6. noodles-bgzf
-# already brings in libdeflate-sys transitively (when the `libdeflate` feature
-# is active); this declaration adds the Rust API surface.
 libdeflater = "1"
 
 [dev-dependencies]

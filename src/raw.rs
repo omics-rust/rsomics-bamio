@@ -1,7 +1,10 @@
 //! Validated owned and borrowing views over BAM record payloads.
 
 use std::io::{self, BufRead, Read, Write};
+use std::mem;
 
+use noodles::sam::alignment::io::Write as _;
+use noodles::{bam, sam};
 use rsomics_common::{Result, RsomicsError};
 
 const REF_ID: usize = 0;
@@ -247,6 +250,51 @@ impl TryFrom<Vec<u8>> for RawRecord {
         validate_payload(&bytes)?;
         Ok(Self { bytes })
     }
+}
+
+/// Encodes alignment records into validated owned BAM payloads.
+pub struct RawRecordEncoder {
+    writer: bam::io::Writer<Vec<u8>>,
+}
+
+impl Default for RawRecordEncoder {
+    fn default() -> Self {
+        Self {
+            writer: bam::io::Writer::from(Vec::new()),
+        }
+    }
+}
+
+impl RawRecordEncoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn encode(
+        &mut self,
+        header: &sam::Header,
+        record: &dyn sam::alignment::Record,
+    ) -> Result<RawRecord> {
+        self.writer
+            .write_alignment_record(header, record)
+            .map_err(RsomicsError::Io)?;
+        let mut framed = mem::take(self.writer.get_mut());
+        let size = framed
+            .get(..4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(invalid_encoded_size)?;
+        if size != framed.len() - 4 {
+            return Err(invalid_encoded_size());
+        }
+        framed.drain(..4);
+        RawRecord::try_from(framed)
+    }
+}
+
+fn invalid_encoded_size() -> RsomicsError {
+    RsomicsError::InvalidInput("BAM encoder produced an invalid record size".to_owned())
 }
 
 impl RawRecord {

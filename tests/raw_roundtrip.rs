@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::num::NonZero;
 use std::path::Path;
 
-use rsomics_bamio::raw::{self, FLAG_DUPLICATE, RawRecord, RecordReader};
+use rsomics_bamio::raw::{self, FLAG_DUPLICATE, RawRecord, RawRecordEncoder, RecordReader};
 
 fn fixture() -> &'static Path {
     Path::new(concat!(
@@ -56,6 +56,24 @@ fn read_all(path: &Path) -> (Vec<RawRecord>, noodles::sam::Header) {
         records.push(rec.clone());
     }
     (records, header)
+}
+
+#[test]
+fn alignment_records_encode_to_the_original_payload() {
+    let (expected, _) = read_all(fixture());
+    let mut reader = rsomics_bamio::open_with_workers(fixture(), NonZero::new(1).unwrap()).unwrap();
+    let header = reader.read_header().unwrap();
+    let records = reader
+        .records()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    let mut encoder = RawRecordEncoder::new();
+    let actual = records
+        .iter()
+        .map(|record| encoder.encode(&header, record).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual, expected);
 }
 
 #[test]

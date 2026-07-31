@@ -8,7 +8,9 @@ I/O for alignment-consuming rsomics products. Initial consumers are
 `RawRecord` owns a validated BAM record payload for in-place edits.
 `RecordReader` yields borrowing `RecordRef` values directly from an inflated
 BGZF block when possible. Both expose the same fixed-field, CIGAR, sequence,
-quality, and auxiliary-data accessors.
+quality, and auxiliary-data accessors. `RawRecordEncoder` converts any noodles
+alignment record into the same validated payload without exposing file-format
+policy.
 
 ```rust
 use rsomics_bamio::{open_with_workers, raw::RecordReader};

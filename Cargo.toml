@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bamio"
-version = "0.2.0"
+version = "0.2.1"
 description = "Validated raw BAM records and parallel BGZF I/O for rsomics products"
 edition = "2024"
 rust-version = "1.91"

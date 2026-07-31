@@ -139,7 +139,10 @@ fn payload_aux_field_range(bytes: &[u8], tag: [u8; 2]) -> Option<std::ops::Range
         let field_tag = [bytes[pos], bytes[pos + 1]];
         let type_code = bytes[pos + 2];
         let value_len = aux_value_len(bytes, pos + 3, type_code)?;
-        let field_end = pos + 3 + value_len;
+        let field_end = pos.checked_add(3)?.checked_add(value_len)?;
+        if field_end > end {
+            return None;
+        }
         if field_tag == tag {
             return Some(pos..field_end);
         }
@@ -280,20 +283,31 @@ macro_rules! raw_field_accessors {
 /// region (name/cigar/seq/qual) is never decoded. Construct via [`read_record`]
 /// or [`RawRecord::default`]; emit via [`write_record`]. For allocation-free
 /// read-only scans use [`RecordRef`] via [`RecordReader`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawRecord {
     bytes: Vec<u8>,
 }
 
 raw_field_accessors!(owned RawRecord);
 
-impl From<Vec<u8>> for RawRecord {
-    /// Construct a [`RawRecord`] from a pre-validated payload byte vector.
-    ///
-    /// `bytes` must be the payload of exactly one BAM record (everything after
-    /// the 4-byte `block_size` field). No validation is performed.
-    fn from(bytes: Vec<u8>) -> Self {
-        RawRecord { bytes }
+impl Default for RawRecord {
+    fn default() -> Self {
+        Self {
+            bytes: vec![
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0xff, 0x48, 0x12, 0x00, 0x00,
+                0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0x00, 0x00, 0x00, 0x00, b'*', 0x00,
+            ],
+        }
+    }
+}
+
+impl TryFrom<Vec<u8>> for RawRecord {
+    type Error = RsomicsError;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self> {
+        validate_payload(&bytes)?;
+        Ok(Self { bytes })
     }
 }
 
@@ -362,11 +376,13 @@ impl RawRecord {
     /// Append a complete aux field: 2-byte `tag`, 1-byte `type_code`, then
     /// `value`. The caller is responsible for the value's on-disk encoding
     /// matching `type_code`. The field is added at the end of the aux tail.
-    pub fn append_aux(&mut self, tag: [u8; 2], type_code: u8, value: &[u8]) {
+    pub fn append_aux(&mut self, tag: [u8; 2], type_code: u8, value: &[u8]) -> Result<()> {
+        validate_aux_value(type_code, value)?;
         self.bytes.push(tag[0]);
         self.bytes.push(tag[1]);
         self.bytes.push(type_code);
         self.bytes.extend_from_slice(value);
+        Ok(())
     }
 
     /// Remove the aux field with `tag`. No-op if absent. Returns whether a field
@@ -384,9 +400,10 @@ impl RawRecord {
     /// Replace the aux field with `tag`, or append it if absent. Equivalent to
     /// [`remove_aux`](Self::remove_aux) followed by
     /// [`append_aux`](Self::append_aux).
-    pub fn set_aux(&mut self, tag: [u8; 2], type_code: u8, value: &[u8]) {
+    pub fn set_aux(&mut self, tag: [u8; 2], type_code: u8, value: &[u8]) -> Result<()> {
+        validate_aux_value(type_code, value)?;
         self.remove_aux(tag);
-        self.append_aux(tag, type_code, value);
+        self.append_aux(tag, type_code, value)
     }
 
     /// Copy `other`'s bytes into `self`, reusing `self`'s allocation when possible.
@@ -421,10 +438,74 @@ fn aux_value_len(bytes: &[u8], pos: usize, type_code: u8) -> Option<usize> {
                 b'i' | b'I' | b'f' => 4,
                 _ => return None,
             };
-            Some(1 + 4 + count * elem)
+            count.checked_mul(elem)?.checked_add(5)
         }
         _ => None,
     }
+}
+
+fn validate_aux_value(type_code: u8, value: &[u8]) -> Result<()> {
+    if aux_value_len(value, 0, type_code) == Some(value.len()) {
+        Ok(())
+    } else {
+        Err(RsomicsError::InvalidInput(format!(
+            "invalid BAM auxiliary value for type {}",
+            char::from(type_code)
+        )))
+    }
+}
+
+fn validate_payload(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < FIXED_HEAD {
+        return Err(invalid_record("payload is shorter than the fixed fields"));
+    }
+
+    let name_len = payload_name_len(bytes);
+    if name_len == 0 {
+        return Err(invalid_record("read name length is zero"));
+    }
+
+    let name_end = FIXED_HEAD
+        .checked_add(name_len)
+        .ok_or_else(|| invalid_record("record layout overflows"))?;
+    if name_end > bytes.len() || bytes[name_end - 1] != 0 {
+        return Err(invalid_record(
+            "read name is truncated or not NUL-terminated",
+        ));
+    }
+
+    let cigar_len = payload_cigar_op_count(bytes)
+        .checked_mul(4)
+        .ok_or_else(|| invalid_record("record layout overflows"))?;
+    let base_count = payload_base_count(bytes);
+    let aux_start = name_end
+        .checked_add(cigar_len)
+        .and_then(|end| end.checked_add(base_count.div_ceil(2)))
+        .and_then(|end| end.checked_add(base_count))
+        .ok_or_else(|| invalid_record("record layout overflows"))?;
+    if aux_start > bytes.len() {
+        return Err(invalid_record("variable-length fields are truncated"));
+    }
+
+    let mut pos = aux_start;
+    while pos < bytes.len() {
+        if bytes.len() - pos < 3 {
+            return Err(invalid_record("auxiliary field header is truncated"));
+        }
+        let value_len = aux_value_len(bytes, pos + 3, bytes[pos + 2])
+            .ok_or_else(|| invalid_record("auxiliary field is malformed"))?;
+        pos = pos
+            .checked_add(3)
+            .and_then(|end| end.checked_add(value_len))
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| invalid_record("auxiliary field is truncated"))?;
+    }
+
+    Ok(())
+}
+
+fn invalid_record(message: &str) -> RsomicsError {
+    RsomicsError::InvalidInput(format!("invalid BAM record: {message}"))
 }
 
 /// Read one raw record's payload from a BGZF `Read` stream into `dst`, returning
@@ -444,6 +525,7 @@ pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize
     reader
         .read_exact(&mut dst.bytes)
         .map_err(RsomicsError::Io)?;
+    validate_payload(&dst.bytes)?;
     Ok(block_size)
 }
 
@@ -463,12 +545,9 @@ raw_field_accessors!(borrowed <'a> RecordRef<'a>);
 
 impl<'a> RecordRef<'a> {
     /// Construct a borrowing view over a raw BAM record payload slice.
-    ///
-    /// `bytes` must be the payload of exactly one BAM record (everything after
-    /// the 4-byte `block_size` field). No validation is performed; callers that
-    /// read from a slab guarantee this invariant by construction.
-    pub fn from_bytes(bytes: &'a [u8]) -> Self {
-        RecordRef { bytes }
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+        validate_payload(bytes)?;
+        Ok(Self { bytes })
     }
 
     /// The raw payload bytes with the record's full borrow lifetime `'a`, so the
@@ -542,6 +621,7 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
             // Defer the consume so this borrow stays valid for the caller.
             self.pending_consume = block_size;
             let bytes = &self.reader.fill_buf().map_err(RsomicsError::Io)?[..block_size];
+            validate_payload(bytes)?;
             Ok(Some(RecordRef { bytes }))
         } else {
             // Record straddles a BGZF block boundary: spill into the scratch buffer.
@@ -549,6 +629,7 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
             self.reader
                 .read_exact(&mut self.scratch)
                 .map_err(RsomicsError::Io)?;
+            validate_payload(&self.scratch)?;
             Ok(Some(RecordRef {
                 bytes: &self.scratch,
             }))
@@ -560,12 +641,21 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
 /// `block_size` (u32 LE). Pass `writer.get_mut()` of a `bam::io::Writer` whose
 /// header has already been written.
 pub fn write_record<W: Write>(writer: &mut W, record: &RawRecord) -> Result<()> {
-    let block_size = u32::try_from(record.bytes.len())
+    write_payload(writer, record.as_bytes())
+}
+
+/// Write a borrowed raw BAM record, including its block-size prefix.
+pub fn write_record_ref<W: Write>(writer: &mut W, record: &RecordRef<'_>) -> Result<()> {
+    write_payload(writer, record.payload())
+}
+
+fn write_payload<W: Write>(writer: &mut W, payload: &[u8]) -> Result<()> {
+    let block_size = u32::try_from(payload.len())
         .map_err(|e| RsomicsError::InvalidInput(format!("record too large: {e}")))?;
     writer
         .write_all(&block_size.to_le_bytes())
         .map_err(RsomicsError::Io)?;
-    writer.write_all(&record.bytes).map_err(RsomicsError::Io)?;
+    writer.write_all(payload).map_err(RsomicsError::Io)?;
     Ok(())
 }
 

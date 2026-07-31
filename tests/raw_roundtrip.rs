@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::num::NonZero;
 use std::path::Path;
 
@@ -214,12 +215,12 @@ fn aux_append_remove_replace_roundtrips() {
 
     // Append a new MQ tag (type 'C', one byte).
     assert!(r.aux_value(*b"MQ").is_none());
-    r.append_aux(*b"MQ", b'C', &[60]);
+    r.append_aux(*b"MQ", b'C', &[60]).unwrap();
     assert_eq!(r.aux_type(*b"MQ"), Some(b'C'));
     assert_eq!(r.aux_value(*b"MQ"), Some(&[60u8][..]));
 
     // Replace it with a different value.
-    r.set_aux(*b"MQ", b'C', &[42]);
+    r.set_aux(*b"MQ", b'C', &[42]).unwrap();
     assert_eq!(r.aux_value(*b"MQ"), Some(&[42u8][..]));
 
     // Remove it; payload returns to its original length.
@@ -227,4 +228,68 @@ fn aux_append_remove_replace_roundtrips() {
     assert!(r.aux_value(*b"MQ").is_none());
     assert_eq!(r.as_bytes().len(), before_len);
     assert!(!r.remove_aux(*b"MQ"));
+}
+
+#[test]
+fn default_record_is_safe_to_inspect() {
+    let record = RawRecord::default();
+    assert_eq!(record.flags(), 0x04);
+    assert_eq!(record.name(), b"*");
+    assert_eq!(record.sequence_len(), 0);
+}
+
+#[test]
+fn malformed_record_layouts_are_rejected() {
+    let valid = RawRecord::default().as_bytes().to_vec();
+    let mut cases = vec![vec![0; 31]];
+
+    let mut zero_name = valid.clone();
+    zero_name[8] = 0;
+    cases.push(zero_name);
+
+    let mut unterminated_name = valid.clone();
+    *unterminated_name.last_mut().unwrap() = b'x';
+    cases.push(unterminated_name);
+
+    let mut truncated_sequence = valid.clone();
+    truncated_sequence[16..20].copy_from_slice(&2u32.to_le_bytes());
+    cases.push(truncated_sequence);
+
+    let mut truncated_aux = valid;
+    truncated_aux.extend_from_slice(b"NMi\x01");
+    cases.push(truncated_aux);
+
+    for payload in cases {
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+
+        let mut record = RawRecord::default();
+        assert!(raw::read_record(&mut Cursor::new(framed.clone()), &mut record).is_err());
+
+        let mut cursor = Cursor::new(framed);
+        let mut scanner = RecordReader::new(&mut cursor);
+        assert!(scanner.next().is_err());
+        assert!(rsomics_bamio::raw::RecordRef::from_bytes(&payload).is_err());
+        assert!(RawRecord::try_from(payload).is_err());
+    }
+}
+
+#[test]
+fn borrowed_record_writes_the_original_payload() {
+    let payload = RawRecord::default().as_bytes().to_vec();
+    let record = rsomics_bamio::raw::RecordRef::from_bytes(&payload).unwrap();
+    let mut actual = Vec::new();
+    raw::write_record_ref(&mut actual, &record).unwrap();
+
+    let mut expected = (payload.len() as u32).to_le_bytes().to_vec();
+    expected.extend_from_slice(&payload);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn invalid_aux_value_does_not_mutate_record() {
+    let mut record = RawRecord::default();
+    let original = record.clone();
+    assert!(record.append_aux(*b"NM", b'i', &[1]).is_err());
+    assert_eq!(record, original);
 }

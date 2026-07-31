@@ -1,39 +1,4 @@
-//! Raw-record BAM read/edit path.
-//!
-//! noodles' `bam::Record` holds the on-disk record bytes but never exposes them
-//! (`Record(pub(crate) Vec<u8>)`, no getter, no `From<Vec<u8>>`), and its writer
-//! re-encodes every record through the BAM codec — decoding and re-emitting
-//! seq/qual/cigar even when a tool only flips a fixed-offset field. For tools
-//! that edit a few header fields (markdup sets the 0x400 duplicate bit; fixmate
-//! rewrites mate fields + MC/MQ), that round-trip is the bottleneck.
-//!
-//! Two record views share one field-decoding core (the `payload_*` free
-//! functions over `&[u8]`):
-//!
-//! - [`RawRecord`] **owns** a record's bytes (the buffer after the 4-byte
-//!   `block_size`, exactly as the BGZF stream stores it). It supports in-place
-//!   edits of fixed-offset fields and the aux tail. seq/qual/cigar/name are
-//!   never decoded — they are passed through byte-for-byte. Use it when the
-//!   record must outlive the next read, or is mutated.
-//! - [`RecordRef`] **borrows** a record's bytes. For read-only scans
-//!   ([`RecordReader`]) the record is read directly out of the BGZF
-//!   reader's already-decompressed block buffer with no per-record allocation
-//!   or copy whenever it lies within one block; only a block-straddling record
-//!   spills into a caller-owned scratch buffer. It exposes the same accessors
-//!   as `RawRecord`.
-//!
-//! [`read_record`] / [`write_record`] move owned records over the BGZF stream
-//! directly (block_size + payload), reusing noodles' `bam::io::Reader`/`Writer`
-//! only for the header.
-//!
-//! Field offsets follow the BAM spec record layout (SAMv1 §4.2), measured from
-//! the start of the payload (after `block_size`):
-//!
-//! ```text
-//! refID@0 pos@4 l_read_name@8 mapq@9 bin@10 n_cigar@12 flag@14 l_seq@16
-//! next_refID@20 next_pos@24 tlen@28
-//! read_name(l_read_name) cigar(4*n_cigar) seq((l_seq+1)/2) qual(l_seq) aux
-//! ```
+//! Validated owned and borrowing views over BAM record payloads.
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -161,11 +126,6 @@ fn payload_aux_type(bytes: &[u8], tag: [u8; 2]) -> Option<u8> {
     Some(bytes[range.start + 2])
 }
 
-/// Generate the read-only field accessors as inherent methods on both
-/// [`RawRecord`] (owned) and [`RecordRef`] (borrowed). Each method delegates to
-/// the `payload_*` free functions over `self.bytes`, keeping the decoding core
-/// in one place while preserving the inherent-method API the `rsomics-bam-*`
-/// tools already call (no trait import required by callers).
 macro_rules! raw_field_accessors {
     (owned $ty:ty) => {
         raw_field_accessors!(@impl impl $ty);
@@ -212,40 +172,27 @@ macro_rules! raw_field_accessors {
                 i32_at(self.payload_bytes(), TLEN)
             }
 
-            /// read_name without the trailing NUL. `*` (the BAM "no name"
-            /// sentinel) is returned as-is — callers that need to distinguish
-            /// handle it.
+            /// The read name without its trailing NUL.
             pub fn name(&self) -> &[u8] {
                 payload_name(self.payload_bytes())
             }
 
-            /// CIGAR operations as `(kind, len)` where `kind` is the 0..=8 op
-            /// code (0=M 1=I 2=D 3=N 4=S 5=H 6=P 7== 8=X). The packed 4-byte
-            /// encoding is read directly, never materialised into noodles types.
+            /// CIGAR operations as BAM `(kind, length)` pairs.
             pub fn cigar_ops(&self) -> impl Iterator<Item = (u8, u32)> + '_ {
                 payload_cigar_ops(self.payload_bytes())
             }
 
-            /// Number of query bases (`l_seq`, offset 16). This is the SEQ/QUAL
-            /// length, not the byte length of either packed field.
+            /// The number of query bases.
             pub fn sequence_len(&self) -> usize {
                 payload_base_count(self.payload_bytes())
             }
 
-            /// The 4-bit `seq_nt16` code (0..=15) of the query base at 0-based
-            /// index `i`, read straight from the packed SEQ nibbles (high nibble
-            /// = even index). The pileup base encoding maps this through
-            /// `seq_nt16_str` (`=ACMGRSVTWYHKDBN`), so the engine carries the raw
-            /// code rather than a decoded byte.
+            /// The BAM `seq_nt16` code at query index `i`.
             pub fn seq_nibble(&self, i: usize) -> u8 {
                 payload_seq_nibble(self.payload_bytes(), i)
             }
 
-            /// The raw packed-nibble SEQ bytes as stored in BAM (2 bases per byte,
-            /// high nibble = base at even query position). Length = `(seq_len+1)/2`.
-            ///
-            /// Prefer this over repeated `seq_nibble` calls in inner loops: it
-            /// computes the sequence start offset once rather than per-call.
+            /// The packed BAM sequence bytes.
             pub fn seq_bytes_packed(&self) -> &[u8] {
                 let bytes = self.payload_bytes();
                 let seq_start = FIXED_HEAD
@@ -255,21 +202,17 @@ macro_rules! raw_field_accessors {
                 &bytes[seq_start..seq_start + seq_len.div_ceil(2)]
             }
 
-            /// Per-base quality scores (Phred, not ASCII-offset). A fully-`0xff`
-            /// block (the BAM "missing qualities" sentinel) yields an empty slice.
+            /// Raw Phred scores, or an empty slice for the missing-score sentinel.
             pub fn quality_scores(&self) -> &[u8] {
                 payload_quality_scores(self.payload_bytes())
             }
 
-            /// Aux field value bytes (type code excluded) for `tag`, or `None` if
-            /// absent.
+            /// Auxiliary value bytes without the type code.
             pub fn aux_value(&self, tag: [u8; 2]) -> Option<&[u8]> {
                 payload_aux_value(self.payload_bytes(), tag)
             }
 
-            /// The aux field's BAM type code
-            /// (`A`/`c`/`C`/`s`/`S`/`i`/`I`/`f`/`Z`/`H`/`B`) for `tag`, or `None`
-            /// if absent.
+            /// The BAM type code for an auxiliary field.
             pub fn aux_type(&self, tag: [u8; 2]) -> Option<u8> {
                 payload_aux_type(self.payload_bytes(), tag)
             }
@@ -277,12 +220,7 @@ macro_rules! raw_field_accessors {
     };
 }
 
-/// An owned BAM record's raw payload bytes (everything after `block_size`).
-///
-/// Edits operate on fixed-offset fields and the aux tail; the variable-length
-/// region (name/cigar/seq/qual) is never decoded. Construct via [`read_record`]
-/// or [`RawRecord::default`]; emit via [`write_record`]. For allocation-free
-/// read-only scans use [`RecordRef`] via [`RecordReader`].
+/// An owned, validated BAM record payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawRecord {
     bytes: Vec<u8>,
@@ -316,22 +254,14 @@ impl RawRecord {
         self.bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    /// Mutable per-base quality scores. The pileup overlap-removal step zeroes /
-    /// scales qualities of overlapping mate bases in place (htslib
-    /// `tweak_overlap_quality`), so it needs to write back into the raw payload.
-    /// Unlike [`quality_scores`](Self::quality_scores) this does not mask the
-    /// `0xff` "missing" sentinel — callers check `sequence_len` and the sentinel
-    /// themselves before mutating.
+    /// Mutable per-base quality bytes, including the missing-score sentinel.
     pub fn quality_scores_mut(&mut self) -> &mut [u8] {
         let base_count = payload_base_count(&self.bytes);
         let start = payload_quality_start(&self.bytes);
         &mut self.bytes[start..start + base_count]
     }
 
-    /// Mutable packed SEQ nibbles. The calmd `use_equal` path rewrites matched
-    /// base nibbles to 0 (the `=` code in `seq_nt16`) in place. The packed
-    /// representation stores two bases per byte: high nibble = even index, low
-    /// nibble = odd index. The returned slice is `(seq_len + 1) / 2` bytes.
+    /// Mutable packed BAM sequence bytes.
     pub fn seq_bytes_mut(&mut self) -> &mut [u8] {
         let base_count = payload_base_count(&self.bytes);
         let start =
@@ -352,7 +282,7 @@ impl RawRecord {
         self.bytes[FLAG..FLAG + 2].copy_from_slice(&new.to_le_bytes());
     }
 
-    /// Salvage step: copies mapped mate's refID onto unmapped partner so a coordinate sort keeps the pair adjacent.
+    /// Set the reference-sequence ID.
     pub fn set_reference_sequence_id(&mut self, value: i32) {
         self.set_i32_at(REF_ID, value);
     }
@@ -406,11 +336,7 @@ impl RawRecord {
         self.append_aux(tag, type_code, value)
     }
 
-    /// Copy `other`'s bytes into `self`, reusing `self`'s allocation when possible.
-    ///
-    /// Unlike `self.clone_from(other)` (which does the same via the derived
-    /// `Clone` impl), this method is explicitly named to signal intent: the caller
-    /// is recycling a pooled buffer to avoid per-record malloc overhead.
+    /// Copy a record while retaining this allocation.
     #[inline]
     pub fn clone_from_raw(&mut self, other: &RawRecord) {
         self.bytes.clear();
@@ -418,8 +344,6 @@ impl RawRecord {
     }
 }
 
-/// Length in bytes of an aux value (excluding the type code) starting at `pos`.
-/// `None` on a malformed/truncated field — callers treat that as a hard error.
 fn aux_value_len(bytes: &[u8], pos: usize, type_code: u8) -> Option<usize> {
     match type_code {
         b'A' | b'c' | b'C' => Some(1),
@@ -508,10 +432,7 @@ fn invalid_record(message: &str) -> RsomicsError {
     RsomicsError::InvalidInput(format!("invalid BAM record: {message}"))
 }
 
-/// Read one raw record's payload from a BGZF `Read` stream into `dst`, returning
-/// the payload length. Returns `0` at end of records (a 0 `block_size`, which
-/// the BGZF EOF block presents). The reader must be positioned after the header
-/// (call `bam::io::Reader::read_header` first, then pass `reader.get_mut()`).
+/// Read and validate one BAM record payload, returning zero at EOF.
 pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize> {
     let mut size_buf = [0u8; 4];
     if !read_exact_or_eof(reader, &mut size_buf).map_err(RsomicsError::Io)? {
@@ -529,13 +450,7 @@ pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize
     Ok(block_size)
 }
 
-/// A borrowed BAM record's raw payload bytes, valid only until the next read.
-///
-/// Produced by [`RecordReader`] for allocation-free read-only scans: the bytes
-/// are borrowed straight out of the BGZF reader's already-inflated block buffer
-/// when the record lies within one block, or out of a reused scratch buffer when
-/// it straddles a block boundary. Exposes the same read accessors as
-/// [`RawRecord`]; there are no setters (the borrow is read-only).
+/// A borrowed, validated BAM record payload.
 #[derive(Clone, Copy, Debug)]
 pub struct RecordRef<'a> {
     bytes: &'a [u8],
@@ -550,34 +465,13 @@ impl<'a> RecordRef<'a> {
         Ok(Self { bytes })
     }
 
-    /// The raw payload bytes with the record's full borrow lifetime `'a`, so the
-    /// slice (and slices derived from it) outlive a by-value `RecordRef`. Prefer
-    /// this over [`as_bytes`](Self::as_bytes) — whose result is tied to `&self` —
-    /// when building a borrowing view (e.g. an aux-field iterator) over a record
-    /// passed by value.
+    /// The validated payload with the record's full borrow lifetime.
     pub fn payload(&self) -> &'a [u8] {
         self.bytes
     }
 }
 
-/// A borrowing, allocation-free record scanner over a BGZF [`BufRead`] stream.
-///
-/// [`next`](RecordReader::next) hands out a [`RecordRef`] borrowed straight out
-/// of the reader's inflated block buffer whenever the whole record sits within
-/// the currently-buffered bytes; a record that straddles a BGZF block boundary
-/// is copied once into a reused scratch buffer. The borrow ties each `RecordRef`
-/// to `&mut self`, so it must be dropped before the next `next()` — the natural
-/// shape for a streaming scan, and the discipline that makes the no-copy borrow
-/// sound without `unsafe`.
-///
-/// The consume of the previous record's bytes is deferred to the start of the
-/// next `next()`: BGZF's `consume` only advances the in-block cursor (it does
-/// not overwrite the block buffer until the next inflate), so deferring keeps
-/// the borrow live for the caller while still advancing correctly.
-///
-/// Construct via [`RecordReader::new`] over a reader positioned after the header
-/// (open with [`open_with_workers`](crate::open_with_workers), call
-/// `read_header`, pass `reader.get_mut()`).
+/// A borrowing record scanner over a buffered BAM stream.
 pub struct RecordReader<'r, R: BufRead> {
     reader: &'r mut R,
     scratch: Vec<u8>,
@@ -594,11 +488,7 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
         }
     }
 
-    /// Read the next record, borrowing its payload. `Ok(None)` at end of records.
-    ///
-    /// The returned [`RecordRef`] borrows `self`, so the borrow checker forbids
-    /// the next call until it is dropped — exactly the invariant the no-copy path
-    /// needs.
+    /// Read and validate the next record.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<RecordRef<'_>>> {
         if self.pending_consume != 0 {
@@ -617,14 +507,12 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
 
         let buffered = self.reader.fill_buf().map_err(RsomicsError::Io)?.len();
         if buffered >= block_size {
-            // Whole record sits in the inflated block buffer: borrow it, no copy.
-            // Defer the consume so this borrow stays valid for the caller.
+            // Consumption is deferred because the returned record borrows this block.
             self.pending_consume = block_size;
             let bytes = &self.reader.fill_buf().map_err(RsomicsError::Io)?[..block_size];
             validate_payload(bytes)?;
             Ok(Some(RecordRef { bytes }))
         } else {
-            // Record straddles a BGZF block boundary: spill into the scratch buffer.
             self.scratch.resize(block_size, 0);
             self.reader
                 .read_exact(&mut self.scratch)
@@ -637,9 +525,7 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
     }
 }
 
-/// Write one raw record's payload to a BGZF `Write` stream, prefixed with its
-/// `block_size` (u32 LE). Pass `writer.get_mut()` of a `bam::io::Writer` whose
-/// header has already been written.
+/// Write an owned raw BAM record with its block-size prefix.
 pub fn write_record<W: Write>(writer: &mut W, record: &RawRecord) -> Result<()> {
     write_payload(writer, record.as_bytes())
 }
@@ -659,9 +545,6 @@ fn write_payload<W: Write>(writer: &mut W, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Fill `buf` from `reader`, returning `false` on a clean EOF before any byte is
-/// read and `true` once `buf` is full. A partial read (EOF mid-buffer) is a hard
-/// error.
 fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {

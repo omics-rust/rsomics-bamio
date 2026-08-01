@@ -19,6 +19,30 @@ const NEXT_POS: usize = 24;
 const TLEN: usize = 28;
 const FIXED_HEAD: usize = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordLayout {
+    seq_start: u32,
+    base_count: u32,
+}
+
+impl RecordLayout {
+    fn seq_start(self) -> usize {
+        self.seq_start as usize
+    }
+
+    fn base_count(self) -> usize {
+        self.base_count as usize
+    }
+
+    fn quality_start(self) -> usize {
+        self.seq_start() + self.base_count().div_ceil(2)
+    }
+
+    fn aux_start(self) -> usize {
+        self.quality_start() + self.base_count()
+    }
+}
+
 /// The 0x400 PCR/optical duplicate flag bit.
 pub const FLAG_DUPLICATE: u16 = 0x400;
 
@@ -61,16 +85,8 @@ fn payload_cigar_ops(bytes: &[u8]) -> impl Iterator<Item = (u8, u32)> + '_ {
     })
 }
 
-fn payload_quality_start(bytes: &[u8]) -> usize {
-    FIXED_HEAD
-        + payload_name_len(bytes)
-        + payload_cigar_op_count(bytes) * 4
-        + payload_base_count(bytes).div_ceil(2)
-}
-
-fn payload_seq_nibble(bytes: &[u8], i: usize) -> u8 {
-    let seq_start = FIXED_HEAD + payload_name_len(bytes) + payload_cigar_op_count(bytes) * 4;
-    let byte = bytes[seq_start + i / 2];
+fn payload_seq_nibble(bytes: &[u8], layout: RecordLayout, i: usize) -> u8 {
+    let byte = bytes[layout.seq_start() + i / 2];
     if i.is_multiple_of(2) {
         byte >> 4
     } else {
@@ -78,10 +94,8 @@ fn payload_seq_nibble(bytes: &[u8], i: usize) -> u8 {
     }
 }
 
-fn payload_quality_scores(bytes: &[u8]) -> &[u8] {
-    let base_count = payload_base_count(bytes);
-    let start = payload_quality_start(bytes);
-    let qual = &bytes[start..start + base_count];
+fn payload_quality_scores(bytes: &[u8], layout: RecordLayout) -> &[u8] {
+    let qual = &bytes[layout.quality_start()..layout.aux_start()];
     if qual.iter().all(|&b| b == 0xff) {
         &[]
     } else {
@@ -89,19 +103,14 @@ fn payload_quality_scores(bytes: &[u8]) -> &[u8] {
     }
 }
 
-fn payload_aux_start(bytes: &[u8]) -> usize {
-    let base_count = payload_base_count(bytes);
-    FIXED_HEAD
-        + payload_name_len(bytes)
-        + payload_cigar_op_count(bytes) * 4
-        + base_count.div_ceil(2)
-        + base_count
-}
-
 /// Byte range of the aux field with `tag`, including the 2-byte tag, the 1-byte
 /// type code, and the value. `None` if absent.
-fn payload_aux_field_range(bytes: &[u8], tag: [u8; 2]) -> Option<std::ops::Range<usize>> {
-    let mut pos = payload_aux_start(bytes);
+fn payload_aux_field_range(
+    bytes: &[u8],
+    layout: RecordLayout,
+    tag: [u8; 2],
+) -> Option<std::ops::Range<usize>> {
+    let mut pos = layout.aux_start();
     let end = bytes.len();
     while pos + 3 <= end {
         let field_tag = [bytes[pos], bytes[pos + 1]];
@@ -119,13 +128,13 @@ fn payload_aux_field_range(bytes: &[u8], tag: [u8; 2]) -> Option<std::ops::Range
     None
 }
 
-fn payload_aux_value(bytes: &[u8], tag: [u8; 2]) -> Option<&[u8]> {
-    let range = payload_aux_field_range(bytes, tag)?;
+fn payload_aux_value(bytes: &[u8], layout: RecordLayout, tag: [u8; 2]) -> Option<&[u8]> {
+    let range = payload_aux_field_range(bytes, layout, tag)?;
     Some(&bytes[range.start + 3..range.end])
 }
 
-fn payload_aux_type(bytes: &[u8], tag: [u8; 2]) -> Option<u8> {
-    let range = payload_aux_field_range(bytes, tag)?;
+fn payload_aux_type(bytes: &[u8], layout: RecordLayout, tag: [u8; 2]) -> Option<u8> {
+    let range = payload_aux_field_range(bytes, layout, tag)?;
     Some(bytes[range.start + 2])
 }
 
@@ -140,6 +149,10 @@ macro_rules! raw_field_accessors {
         $($head)+ {
             fn payload_bytes(&self) -> &[u8] {
                 &self.bytes[..]
+            }
+
+            fn layout(&self) -> RecordLayout {
+                self.layout
             }
 
             pub fn as_bytes(&self) -> &[u8] {
@@ -187,37 +200,34 @@ macro_rules! raw_field_accessors {
 
             /// The number of query bases.
             pub fn sequence_len(&self) -> usize {
-                payload_base_count(self.payload_bytes())
+                self.layout().base_count()
             }
 
             /// The BAM `seq_nt16` code at query index `i`.
             pub fn seq_nibble(&self, i: usize) -> u8 {
-                payload_seq_nibble(self.payload_bytes(), i)
+                payload_seq_nibble(self.payload_bytes(), self.layout(), i)
             }
 
             /// The packed BAM sequence bytes.
             pub fn seq_bytes_packed(&self) -> &[u8] {
                 let bytes = self.payload_bytes();
-                let seq_start = FIXED_HEAD
-                    + payload_name_len(bytes)
-                    + payload_cigar_op_count(bytes) * 4;
-                let seq_len = payload_base_count(bytes);
-                &bytes[seq_start..seq_start + seq_len.div_ceil(2)]
+                let layout = self.layout();
+                &bytes[layout.seq_start()..layout.quality_start()]
             }
 
             /// Raw Phred scores, or an empty slice for the missing-score sentinel.
             pub fn quality_scores(&self) -> &[u8] {
-                payload_quality_scores(self.payload_bytes())
+                payload_quality_scores(self.payload_bytes(), self.layout())
             }
 
             /// Auxiliary value bytes without the type code.
             pub fn aux_value(&self, tag: [u8; 2]) -> Option<&[u8]> {
-                payload_aux_value(self.payload_bytes(), tag)
+                payload_aux_value(self.payload_bytes(), self.layout(), tag)
             }
 
             /// The BAM type code for an auxiliary field.
             pub fn aux_type(&self, tag: [u8; 2]) -> Option<u8> {
-                payload_aux_type(self.payload_bytes(), tag)
+                payload_aux_type(self.payload_bytes(), self.layout(), tag)
             }
         }
     };
@@ -227,6 +237,7 @@ macro_rules! raw_field_accessors {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawRecord {
     bytes: Vec<u8>,
+    layout: RecordLayout,
 }
 
 raw_field_accessors!(owned RawRecord);
@@ -239,6 +250,10 @@ impl Default for RawRecord {
                 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0x00, 0x00, 0x00, 0x00, b'*', 0x00,
             ],
+            layout: RecordLayout {
+                seq_start: 34,
+                base_count: 0,
+            },
         }
     }
 }
@@ -247,8 +262,8 @@ impl TryFrom<Vec<u8>> for RawRecord {
     type Error = RsomicsError;
 
     fn try_from(bytes: Vec<u8>) -> Result<Self> {
-        validate_payload(&bytes)?;
-        Ok(Self { bytes })
+        let layout = validate_payload(&bytes)?;
+        Ok(Self { bytes, layout })
     }
 }
 
@@ -304,18 +319,12 @@ impl RawRecord {
 
     /// Mutable per-base quality bytes, including the missing-score sentinel.
     pub fn quality_scores_mut(&mut self) -> &mut [u8] {
-        let base_count = payload_base_count(&self.bytes);
-        let start = payload_quality_start(&self.bytes);
-        &mut self.bytes[start..start + base_count]
+        &mut self.bytes[self.layout.quality_start()..self.layout.aux_start()]
     }
 
     /// Mutable packed BAM sequence bytes.
     pub fn seq_bytes_mut(&mut self) -> &mut [u8] {
-        let base_count = payload_base_count(&self.bytes);
-        let start =
-            FIXED_HEAD + payload_name_len(&self.bytes) + payload_cigar_op_count(&self.bytes) * 4;
-        let end = start + base_count.div_ceil(2);
-        &mut self.bytes[start..end]
+        &mut self.bytes[self.layout.seq_start()..self.layout.quality_start()]
     }
 
     /// Set the given FLAG bits (offset 14). Other bits are left untouched.
@@ -366,7 +375,7 @@ impl RawRecord {
     /// Remove the aux field with `tag`. No-op if absent. Returns whether a field
     /// was removed.
     pub fn remove_aux(&mut self, tag: [u8; 2]) -> bool {
-        match payload_aux_field_range(&self.bytes, tag) {
+        match payload_aux_field_range(&self.bytes, self.layout, tag) {
             Some(range) => {
                 self.bytes.drain(range);
                 true
@@ -389,6 +398,7 @@ impl RawRecord {
     pub fn clone_from_raw(&mut self, other: &RawRecord) {
         self.bytes.clear();
         self.bytes.extend_from_slice(&other.bytes);
+        self.layout = other.layout;
     }
 }
 
@@ -427,7 +437,7 @@ fn validate_aux_value(type_code: u8, value: &[u8]) -> Result<()> {
     }
 }
 
-fn validate_payload(bytes: &[u8]) -> Result<()> {
+fn validate_payload(bytes: &[u8]) -> Result<RecordLayout> {
     if bytes.len() < FIXED_HEAD {
         return Err(invalid_record("payload is shorter than the fixed fields"));
     }
@@ -450,14 +460,25 @@ fn validate_payload(bytes: &[u8]) -> Result<()> {
         .checked_mul(4)
         .ok_or_else(|| invalid_record("record layout overflows"))?;
     let base_count = payload_base_count(bytes);
-    let aux_start = name_end
+    let seq_start = name_end
         .checked_add(cigar_len)
-        .and_then(|end| end.checked_add(base_count.div_ceil(2)))
-        .and_then(|end| end.checked_add(base_count))
+        .ok_or_else(|| invalid_record("record layout overflows"))?;
+    let quality_start = seq_start
+        .checked_add(base_count.div_ceil(2))
+        .ok_or_else(|| invalid_record("record layout overflows"))?;
+    let aux_start = quality_start
+        .checked_add(base_count)
         .ok_or_else(|| invalid_record("record layout overflows"))?;
     if aux_start > bytes.len() {
         return Err(invalid_record("variable-length fields are truncated"));
     }
+
+    let layout = RecordLayout {
+        seq_start: u32::try_from(seq_start)
+            .map_err(|_| invalid_record("record layout overflows"))?,
+        base_count: u32::try_from(base_count)
+            .map_err(|_| invalid_record("record layout overflows"))?,
+    };
 
     let mut pos = aux_start;
     while pos < bytes.len() {
@@ -473,7 +494,7 @@ fn validate_payload(bytes: &[u8]) -> Result<()> {
             .ok_or_else(|| invalid_record("auxiliary field is truncated"))?;
     }
 
-    Ok(())
+    Ok(layout)
 }
 
 fn invalid_record(message: &str) -> RsomicsError {
@@ -494,7 +515,7 @@ pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize
     reader
         .read_exact(&mut dst.bytes)
         .map_err(RsomicsError::Io)?;
-    validate_payload(&dst.bytes)?;
+    dst.layout = validate_payload(&dst.bytes)?;
     Ok(block_size)
 }
 
@@ -502,6 +523,7 @@ pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize
 #[derive(Clone, Copy, Debug)]
 pub struct RecordRef<'a> {
     bytes: &'a [u8],
+    layout: RecordLayout,
 }
 
 raw_field_accessors!(borrowed <'a> RecordRef<'a>);
@@ -509,8 +531,8 @@ raw_field_accessors!(borrowed <'a> RecordRef<'a>);
 impl<'a> RecordRef<'a> {
     /// Construct a borrowing view over a raw BAM record payload slice.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
-        validate_payload(bytes)?;
-        Ok(Self { bytes })
+        let layout = validate_payload(bytes)?;
+        Ok(Self { bytes, layout })
     }
 
     /// The validated payload with the record's full borrow lifetime.
@@ -558,16 +580,17 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
             // Consumption is deferred because the returned record borrows this block.
             self.pending_consume = block_size;
             let bytes = &self.reader.fill_buf().map_err(RsomicsError::Io)?[..block_size];
-            validate_payload(bytes)?;
-            Ok(Some(RecordRef { bytes }))
+            let layout = validate_payload(bytes)?;
+            Ok(Some(RecordRef { bytes, layout }))
         } else {
             self.scratch.resize(block_size, 0);
             self.reader
                 .read_exact(&mut self.scratch)
                 .map_err(RsomicsError::Io)?;
-            validate_payload(&self.scratch)?;
+            let layout = validate_payload(&self.scratch)?;
             Ok(Some(RecordRef {
                 bytes: &self.scratch,
+                layout,
             }))
         }
     }

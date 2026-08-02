@@ -311,3 +311,38 @@ fn invalid_aux_value_does_not_mutate_record() {
     assert!(record.append_aux(*b"NM", b'i', &[1]).is_err());
     assert_eq!(record, original);
 }
+
+#[test]
+fn decoded_cigar_replaces_the_bam_long_cigar_placeholder() {
+    let mut reader = noodles::sam::io::Reader::new(
+        b"@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:20\nread\t0\tchr1\t1\t60\t1S1N\t*\t0\t0\tA\tI\n".as_slice(),
+    );
+    let header = reader.read_header().unwrap();
+    let record = reader.record_bufs(&header).next().unwrap().unwrap();
+    let mut raw = RawRecordEncoder::new().encode(&header, &record).unwrap();
+    let count = usize::from(u16::MAX) + 1;
+    let mut value = Vec::with_capacity(5 + count * 4);
+    value.push(b'I');
+    value.extend_from_slice(&(count as u32).to_le_bytes());
+    for _ in 0..count - 1 {
+        value.extend_from_slice(&((1u32 << 4) | 5).to_le_bytes());
+    }
+    value.extend_from_slice(&(1u32 << 4).to_le_bytes());
+    raw.append_aux(*b"CG", b'B', &value).unwrap();
+
+    let cigar = raw.decoded_cigar().unwrap();
+    assert_eq!(cigar.len(), count);
+    assert_eq!(cigar.last(), Some(&(0, 1)));
+    let borrowed = rsomics_bamio::raw::RecordRef::from_bytes(raw.as_bytes()).unwrap();
+    assert_eq!(borrowed.decoded_cigar().unwrap(), cigar);
+}
+
+#[test]
+fn decoded_cigar_rejects_invalid_operations() {
+    let (records, _) = read_all(fixture());
+    let mut payload = records[0].as_bytes().to_vec();
+    let cigar_start = 32 + usize::from(payload[8]);
+    payload[cigar_start..cigar_start + 4].copy_from_slice(&((1u32 << 4) | 9).to_le_bytes());
+    let record = RawRecord::try_from(payload).unwrap();
+    assert!(record.decoded_cigar().is_err());
+}

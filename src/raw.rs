@@ -18,6 +18,8 @@ const NEXT_REF_ID: usize = 20;
 const NEXT_POS: usize = 24;
 const TLEN: usize = 28;
 const FIXED_HEAD: usize = 32;
+const CIGAR_REFERENCE_SKIP: u8 = 3;
+const CIGAR_SOFT_CLIP: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordLayout {
@@ -83,6 +85,103 @@ fn payload_cigar_ops(bytes: &[u8]) -> impl Iterator<Item = (u8, u32)> + '_ {
         let raw = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         ((raw & 0xf) as u8, raw >> 4)
     })
+}
+
+fn payload_decoded_cigar(bytes: &[u8], layout: RecordLayout) -> Result<Vec<(u8, u32)>> {
+    let raw = payload_cigar_ops(bytes).collect::<Vec<_>>();
+    let cigar = if raw.len() == 2
+        && raw[0] == (CIGAR_SOFT_CLIP, layout.base_count)
+        && raw[1].0 == CIGAR_REFERENCE_SKIP
+        && payload_aux_type(bytes, layout, *b"CG") == Some(b'B')
+    {
+        payload_long_cigar(bytes, layout, raw[1].1)?
+    } else {
+        raw
+    };
+    for &(kind, length) in &cigar {
+        if kind > 8 {
+            return Err(invalid_cigar(
+                bytes,
+                format!("unsupported CIGAR operation {kind}"),
+            ));
+        }
+        if length == 0 {
+            return Err(invalid_cigar(
+                bytes,
+                "CIGAR contains a zero-length operation",
+            ));
+        }
+    }
+    Ok(cigar)
+}
+
+fn payload_long_cigar(
+    bytes: &[u8],
+    layout: RecordLayout,
+    placeholder_span: u32,
+) -> Result<Vec<(u8, u32)>> {
+    let value = payload_aux_value(bytes, layout, *b"CG")
+        .ok_or_else(|| invalid_cigar(bytes, "CG long-CIGAR field is absent"))?;
+    if value.len() < 5 || value[0] != b'I' {
+        return Err(invalid_cigar(
+            bytes,
+            "CG long-CIGAR field is not a B,I array",
+        ));
+    }
+    let count = usize::try_from(u32::from_le_bytes(
+        value[1..5]
+            .try_into()
+            .expect("long-CIGAR count has four bytes"),
+    ))
+    .map_err(|error| invalid_cigar(bytes, error))?;
+    if count <= usize::from(u16::MAX) {
+        return Err(invalid_cigar(
+            bytes,
+            "CG long-CIGAR field does not exceed the BAM operation limit",
+        ));
+    }
+    let expected = count
+        .checked_mul(4)
+        .and_then(|length| length.checked_add(5))
+        .ok_or_else(|| invalid_cigar(bytes, "CG long-CIGAR length overflows"))?;
+    if value.len() != expected {
+        return Err(invalid_cigar(
+            bytes,
+            "CG long-CIGAR field has the wrong length",
+        ));
+    }
+    let cigar = value[5..]
+        .chunks_exact(4)
+        .map(|chunk| {
+            let packed = u32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .expect("long-CIGAR operation has four bytes"),
+            );
+            ((packed & 0x0f) as u8, packed >> 4)
+        })
+        .collect::<Vec<_>>();
+    let reference_span = cigar
+        .iter()
+        .filter(|(kind, _)| matches!(kind, 0 | 2 | 3 | 7 | 8))
+        .try_fold(0u64, |span, (_, length)| {
+            span.checked_add(u64::from(*length))
+        })
+        .ok_or_else(|| invalid_cigar(bytes, "CG long-CIGAR reference span overflows"))?;
+    if reference_span != u64::from(placeholder_span) {
+        return Err(invalid_cigar(
+            bytes,
+            "CG long-CIGAR reference span differs from its placeholder",
+        ));
+    }
+    Ok(cigar)
+}
+
+fn invalid_cigar(bytes: &[u8], reason: impl std::fmt::Display) -> RsomicsError {
+    RsomicsError::InvalidInput(format!(
+        "read {}: {reason}",
+        String::from_utf8_lossy(payload_name(bytes))
+    ))
 }
 
 fn payload_seq_nibble(bytes: &[u8], layout: RecordLayout, i: usize) -> u8 {
@@ -196,6 +295,11 @@ macro_rules! raw_field_accessors {
             /// CIGAR operations as BAM `(kind, length)` pairs.
             pub fn cigar_ops(&self) -> impl Iterator<Item = (u8, u32)> + '_ {
                 payload_cigar_ops(self.payload_bytes())
+            }
+
+            /// The decoded BAM CIGAR, including a `CG:B,I` long CIGAR.
+            pub fn decoded_cigar(&self) -> Result<Vec<(u8, u32)>> {
+                payload_decoded_cigar(self.payload_bytes(), self.layout())
             }
 
             /// The number of query bases.

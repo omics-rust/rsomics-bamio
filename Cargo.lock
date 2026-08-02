@@ -659,7 +659,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rsomics-bamio"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "crossbeam-channel",
  "libdeflater",
@@ -672,11 +672,12 @@ dependencies = [
 
 [[package]]
 name = "rsomics-common"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a69695dae27897693c49ebedd96355dc9a5decb9f21956f0e8d9c5ce135a5ec"
+checksum = "cf3e31808c6a131ab789ee4a135bf46fd3eaafb87d3dc0d264e6e620f74bc3e7"
 dependencies = [
  "clap",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
@@ -694,6 +695,15 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
+]
+
+[[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
 ]
 
 [[package]]
@@ -892,6 +902,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

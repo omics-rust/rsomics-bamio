@@ -14,7 +14,7 @@ pub mod raw;
 pub mod ring_writer;
 
 pub use batch::{BatchBamWriter, RingBatchBamWriter};
-pub use indexed::{IndexedAlignmentReader, open_indexed_alignment};
+pub use indexed::{IndexedAlignmentReader, open_indexed_alignment, visit_raw_alignment_records};
 pub use ring_writer::{RingBgzfWriter, create_ring_bgzf};
 
 const READ_BUFFER: usize = 256 * 1024;

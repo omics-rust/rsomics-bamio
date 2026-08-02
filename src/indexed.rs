@@ -2,9 +2,11 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use noodles::{bam, bgzf, cram, csi, fasta};
+use noodles::{bam, bgzf, cram, csi, fasta, sam};
 use noodles_util::alignment;
 use rsomics_common::{Result, RsomicsError};
+
+use crate::raw::{self, RawRecord, RawRecordEncoder};
 
 /// A format-independent indexed SAM, BAM, or CRAM reader.
 pub type IndexedAlignmentReader = alignment::io::IndexedReader<File>;
@@ -45,6 +47,35 @@ pub fn open_indexed_alignment(
             input.display()
         ))
     })
+}
+
+/// Visits every alignment record from the current stream position as a validated BAM payload.
+///
+/// BAM input is read without decoding and re-encoding each record. SAM and CRAM
+/// records are normalized into the same representation before being visited.
+pub fn visit_raw_alignment_records(
+    reader: &mut IndexedAlignmentReader,
+    header: &sam::Header,
+    mut visit: impl FnMut(RawRecord) -> Result<()>,
+) -> Result<()> {
+    if let IndexedAlignmentReader::Bam(reader) = reader {
+        loop {
+            let mut record = RawRecord::default();
+            if raw::read_record(reader.get_mut(), &mut record)? == 0 {
+                break;
+            }
+            visit(record)?;
+        }
+        return Ok(());
+    }
+
+    let mut encoder = RawRecordEncoder::new();
+    for result in reader.records(header) {
+        let record = result.map_err(RsomicsError::Io)?;
+        let record = encoder.encode(header, record.as_ref())?;
+        visit(record)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +252,16 @@ mod tests {
             .collect::<std::io::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(records.len(), 1);
+
+        let mut reader = open_indexed_alignment(&input, None).unwrap();
+        let header = reader.read_header().unwrap();
+        let mut names = Vec::new();
+        visit_raw_alignment_records(&mut reader, &header, |record| {
+            names.push(record.name().to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(names, [b"read"]);
     }
 
     #[test]

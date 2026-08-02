@@ -37,5 +37,7 @@ CRAM callers can attach an indexed reference without duplicating repository
 setup in each product. `visit_raw_alignment_records` reads BAM payloads
 directly, converts CRAM through HTSlib's reusable record buffer, and preserves
 the same validated callback contract for every supported format.
+Consumers that only use BAM primitives can disable default features to omit
+the HTSlib CRAM backend.
 
 License: MIT OR Apache-2.0.

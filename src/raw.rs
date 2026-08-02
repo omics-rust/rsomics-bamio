@@ -412,6 +412,7 @@ impl RawRecordEncoder {
     }
 }
 
+#[cfg(feature = "cram-htslib")]
 pub(crate) fn from_htslib_record(record: &rust_htslib::bam::Record) -> Result<RawRecord> {
     let inner = record.inner();
     let core = &inner.core;
@@ -824,7 +825,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cram-htslib"))]
 mod tests {
     use rust_htslib::bam::record::{Cigar, CigarString};
 

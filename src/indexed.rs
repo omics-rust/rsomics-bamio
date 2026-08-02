@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use noodles::{bam, bgzf, cram, csi, fasta, sam};
 use noodles_util::alignment;
 use rsomics_common::{Result, RsomicsError};
+#[cfg(feature = "cram-htslib")]
 use rust_htslib::bam::Read as _;
 
 use crate::raw::{self, RawRecord, RawRecordEncoder};
@@ -83,6 +84,7 @@ pub fn visit_raw_alignment_records(
     header: &sam::Header,
     mut visit: impl FnMut(RawRecord) -> Result<()>,
 ) -> Result<()> {
+    #[cfg(feature = "cram-htslib")]
     if matches!(reader.inner, alignment::io::IndexedReader::Cram(_)) {
         visit_htslib_records(&reader.input, reader.reference.as_deref(), visit)?;
         return Ok(());
@@ -110,6 +112,7 @@ pub fn visit_raw_alignment_records(
     Ok(())
 }
 
+#[cfg(feature = "cram-htslib")]
 fn visit_htslib_records(
     input: &Path,
     reference: Option<&Path>,

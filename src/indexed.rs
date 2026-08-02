@@ -1,15 +1,35 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use noodles::{bam, bgzf, cram, csi, fasta, sam};
 use noodles_util::alignment;
 use rsomics_common::{Result, RsomicsError};
+use rust_htslib::bam::Read as _;
 
 use crate::raw::{self, RawRecord, RawRecordEncoder};
 
 /// A format-independent indexed SAM, BAM, or CRAM reader.
-pub type IndexedAlignmentReader = alignment::io::IndexedReader<File>;
+pub struct IndexedAlignmentReader {
+    inner: alignment::io::IndexedReader<File>,
+    input: PathBuf,
+    reference: Option<PathBuf>,
+}
+
+impl Deref for IndexedAlignmentReader {
+    type Target = alignment::io::IndexedReader<File>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for IndexedAlignmentReader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Opens an indexed alignment file and optionally attaches an indexed reference.
 ///
@@ -41,15 +61,20 @@ pub fn open_indexed_alignment(
         builder = builder.set_reference_sequence_repository(reference_repository(reference)?);
     }
     builder = set_alternative_index(builder, input, format)?;
-    builder.build_from_path(input).map_err(|error| {
+    let inner = builder.build_from_path(input).map_err(|error| {
         RsomicsError::InvalidInput(format!(
             "opening indexed alignment input {}: {error}",
             input.display()
         ))
+    })?;
+    Ok(IndexedAlignmentReader {
+        inner,
+        input: input.to_path_buf(),
+        reference: reference.map(Path::to_path_buf),
     })
 }
 
-/// Visits every alignment record from the current stream position as a validated BAM payload.
+/// Visits every alignment record as a validated BAM payload.
 ///
 /// BAM input is read without decoding and re-encoding each record. SAM and CRAM
 /// records are normalized into the same representation before being visited.
@@ -58,7 +83,14 @@ pub fn visit_raw_alignment_records(
     header: &sam::Header,
     mut visit: impl FnMut(RawRecord) -> Result<()>,
 ) -> Result<()> {
-    if let IndexedAlignmentReader::Bam(reader) = reader {
+    if matches!(reader.inner, alignment::io::IndexedReader::Cram(_)) {
+        visit_htslib_records(&reader.input, reader.reference.as_deref(), visit)?;
+        return Ok(());
+    }
+
+    let mut scan = open_indexed_alignment(&reader.input, reader.reference.as_deref())?;
+    scan.read_header().map_err(RsomicsError::Io)?;
+    if let alignment::io::IndexedReader::Bam(reader) = &mut scan.inner {
         loop {
             let mut record = RawRecord::default();
             if raw::read_record(reader.get_mut(), &mut record)? == 0 {
@@ -70,10 +102,37 @@ pub fn visit_raw_alignment_records(
     }
 
     let mut encoder = RawRecordEncoder::new();
-    for result in reader.records(header) {
+    for result in scan.records(header) {
         let record = result.map_err(RsomicsError::Io)?;
         let record = encoder.encode(header, record.as_ref())?;
         visit(record)?;
+    }
+    Ok(())
+}
+
+fn visit_htslib_records(
+    input: &Path,
+    reference: Option<&Path>,
+    mut visit: impl FnMut(RawRecord) -> Result<()>,
+) -> Result<()> {
+    let mut reader = rust_htslib::bam::Reader::from_path(input).map_err(|error| {
+        RsomicsError::InvalidInput(format!("opening CRAM input {}: {error}", input.display()))
+    })?;
+    if let Some(reference) = reference {
+        reader.set_reference(reference).map_err(|error| {
+            RsomicsError::ConfigError(format!(
+                "attaching CRAM reference {}: {error}",
+                reference.display()
+            ))
+        })?;
+    }
+
+    let mut record = rust_htslib::bam::Record::new();
+    while let Some(result) = reader.read(&mut record) {
+        result.map_err(|error| {
+            RsomicsError::InvalidInput(format!("reading CRAM input {}: {error}", input.display()))
+        })?;
+        visit(raw::from_htslib_record(&record)?)?;
     }
     Ok(())
 }
@@ -255,13 +314,77 @@ mod tests {
 
         let mut reader = open_indexed_alignment(&input, None).unwrap();
         let header = reader.read_header().unwrap();
-        let mut names = Vec::new();
+        let mut records = Vec::new();
         visit_raw_alignment_records(&mut reader, &header, |record| {
-            names.push(record.name().to_vec());
+            records.push(record);
             Ok(())
         })
         .unwrap();
-        assert_eq!(names, [b"read"]);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.name(), b"read");
+        assert_eq!(record.reference_sequence_id(), 0);
+        assert_eq!(record.alignment_start(), 2);
+        assert_eq!(record.mapping_quality(), 60);
+        assert_eq!(record.cigar_ops().collect::<Vec<_>>(), [(0, 1)]);
+        assert_eq!(record.sequence_len(), 1);
+        assert_eq!(record.quality_scores(), [40]);
+    }
+
+    #[test]
+    fn visits_cram_records_from_slices() {
+        let directory = tempfile::tempdir().unwrap();
+        let reference = directory.path().join("reference.fa");
+        std::fs::write(&reference, b">chr1\nACGTACGTACGTACGTACGT\n").unwrap();
+        std::fs::write(
+            append_extension(&reference, "fai"),
+            b"chr1\t20\t6\t20\t21\n",
+        )
+        .unwrap();
+
+        let input = directory.path().join("records.cram");
+        let mut source = sam::io::Reader::new(
+            b"@HD\tVN:1.6\tSO:coordinate\n\
+              @SQ\tSN:chr1\tLN:20\n\
+              read\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGTAC\tIIII\n"
+                .as_slice(),
+        );
+        let header = source.read_header().unwrap();
+        let records = source
+            .record_bufs(&header)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let repository = reference_repository(&reference).unwrap();
+        let mut writer = cram::io::writer::Builder::default()
+            .set_reference_sequence_repository(repository)
+            .build_from_path(&input)
+            .unwrap();
+        writer.write_header(&header).unwrap();
+        for record in records {
+            writer.write_alignment_record(&header, &record).unwrap();
+        }
+        writer.try_finish(&header).unwrap();
+
+        let index = cram::fs::index(&input).unwrap();
+        cram::crai::fs::write(append_extension(&input, "crai"), &index).unwrap();
+
+        let mut reader = open_indexed_alignment(&input, Some(&reference)).unwrap();
+        let header = reader.read_header().unwrap();
+        let mut records = Vec::new();
+        visit_raw_alignment_records(&mut reader, &header, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.name(), b"read");
+        assert_eq!(record.reference_sequence_id(), 0);
+        assert_eq!(record.alignment_start(), 2);
+        assert_eq!(record.mapping_quality(), 60);
+        assert_eq!(record.cigar_ops().collect::<Vec<_>>(), [(0, 4)]);
+        assert_eq!(record.sequence_len(), 4);
+        assert_eq!(record.quality_scores(), [40; 4]);
     }
 
     #[test]

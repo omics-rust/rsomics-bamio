@@ -34,8 +34,8 @@ in the consuming product.
 `open_indexed_alignment` opens BGZF SAM, BAM, or CRAM input with the usual
 appended index names and the common alternative names such as `sample.bai`.
 CRAM callers can attach an indexed reference without duplicating repository
-setup in each product. `visit_raw_alignment_records` reads sequential BAM
-records directly into `RawRecord` and normalizes SAM or CRAM records through
-the same callback contract.
+setup in each product. `visit_raw_alignment_records` reads BAM payloads
+directly, converts CRAM through HTSlib's reusable record buffer, and preserves
+the same validated callback contract for every supported format.
 
 License: MIT OR Apache-2.0.

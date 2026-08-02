@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bamio"
-version = "0.7.0"
+version = "0.8.0"
 description = "Validated alignment records and indexed or parallel I/O for rsomics products"
 edition = "2024"
 rust-version = "1.91"
@@ -18,6 +18,7 @@ rsomics-common = "0.12"
 noodles = { version = "0.110", features = ["sam", "bam", "bgzf", "core", "cram", "csi", "fasta"] }
 noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 noodles-util = { version = "0.79", features = ["alignment"] }
+rust-htslib = { version = "1.0.1", default-features = false, features = ["bzip2", "lzma", "libdeflate"] }
 crossbeam-channel = "0.5"
 libdeflater = "1"
 

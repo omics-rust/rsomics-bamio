@@ -412,6 +412,88 @@ impl RawRecordEncoder {
     }
 }
 
+pub(crate) fn from_htslib_record(record: &rust_htslib::bam::Record) -> Result<RawRecord> {
+    let inner = record.inner();
+    let core = &inner.core;
+    let data_len = usize::try_from(inner.l_data)
+        .map_err(|_| invalid_record("HTSlib record has a negative data length"))?;
+    let data = if data_len == 0 {
+        &[]
+    } else {
+        // SAFETY: HTSlib owns `data` and guarantees `l_data` initialized bytes until mutation.
+        unsafe { std::slice::from_raw_parts(inner.data, data_len) }
+    };
+    let qname_storage = usize::from(core.l_qname);
+    let extra_nuls = usize::from(core.l_extranul);
+    let qname_len = qname_storage
+        .checked_sub(extra_nuls)
+        .filter(|&len| len > 0 && len <= u8::MAX as usize)
+        .ok_or_else(|| invalid_record("HTSlib record has an invalid read name length"))?;
+    let cigar_len = usize::try_from(core.n_cigar)
+        .ok()
+        .and_then(|len| len.checked_mul(4))
+        .ok_or_else(|| invalid_record("HTSlib record CIGAR length overflows"))?;
+    let cigar_end = qname_storage
+        .checked_add(cigar_len)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| invalid_record("HTSlib record data is truncated"))?;
+    let position = i32::try_from(core.pos)
+        .map_err(|_| invalid_record("HTSlib record position exceeds BAM limits"))?;
+    let mate_position = i32::try_from(core.mpos)
+        .map_err(|_| invalid_record("HTSlib mate position exceeds BAM limits"))?;
+    let template_length = i32::try_from(core.isize_)
+        .map_err(|_| invalid_record("HTSlib template length exceeds BAM limits"))?;
+
+    let long_cigar = core.n_cigar > u16::MAX.into();
+    let encoded_cigar_count = if long_cigar { 2 } else { core.n_cigar as u16 };
+    let mut bytes = Vec::with_capacity(32 + data_len - extra_nuls + usize::from(long_cigar) * 16);
+    bytes.extend_from_slice(&core.tid.to_le_bytes());
+    bytes.extend_from_slice(&position.to_le_bytes());
+    bytes.extend_from_slice(
+        &((u32::from(core.bin) << 16) | (u32::from(core.qual) << 8) | qname_len as u32)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &((u32::from(core.flag) << 16) | u32::from(encoded_cigar_count)).to_le_bytes(),
+    );
+    bytes.extend_from_slice(&core.l_qseq.to_le_bytes());
+    bytes.extend_from_slice(&core.mtid.to_le_bytes());
+    bytes.extend_from_slice(&mate_position.to_le_bytes());
+    bytes.extend_from_slice(&template_length.to_le_bytes());
+    bytes.extend_from_slice(&data[..qname_len]);
+
+    if long_cigar {
+        let read_len = u32::try_from(core.l_qseq)
+            .ok()
+            .filter(|&len| len < 1 << 28)
+            .ok_or_else(|| invalid_record("HTSlib record sequence length exceeds BAM limits"))?;
+        let reference_len = data[qname_storage..cigar_end]
+            .chunks_exact(4)
+            .try_fold(0_u32, |sum, chunk| {
+                let op = u32::from_ne_bytes(chunk.try_into().unwrap());
+                if matches!(op & 0x0f, 0 | 2 | 3 | 7 | 8) {
+                    sum.checked_add(op >> 4)
+                } else {
+                    Some(sum)
+                }
+            })
+            .filter(|&len| len < 1 << 28)
+            .ok_or_else(|| invalid_record("HTSlib record reference span exceeds BAM limits"))?;
+        bytes.extend_from_slice(&((read_len << 4) | 4).to_le_bytes());
+        bytes.extend_from_slice(&((reference_len << 4) | 3).to_le_bytes());
+        bytes.extend_from_slice(&data[cigar_end..]);
+        bytes.extend_from_slice(b"CGBI");
+        bytes.extend_from_slice(&core.n_cigar.to_le_bytes());
+        for chunk in data[qname_storage..cigar_end].chunks_exact(4) {
+            bytes.extend_from_slice(&u32::from_ne_bytes(chunk.try_into().unwrap()).to_le_bytes());
+        }
+    } else {
+        bytes.extend_from_slice(&data[qname_storage..]);
+    }
+
+    RawRecord::try_from(bytes)
+}
+
 fn invalid_encoded_size() -> RsomicsError {
     RsomicsError::InvalidInput("BAM encoder produced an invalid record size".to_owned())
 }
@@ -739,5 +821,32 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
             io::ErrorKind::UnexpectedEof,
             "truncated BAM record block size",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_htslib::bam::record::{Cigar, CigarString};
+
+    use super::*;
+
+    #[test]
+    fn converts_htslib_long_cigar_to_bam_encoding() {
+        let cigar = CigarString(vec![Cigar::Match(1); usize::from(u16::MAX) + 1]);
+        let sequence = vec![b'A'; cigar.len()];
+        let qualities = vec![30; cigar.len()];
+        let mut record = rust_htslib::bam::Record::new();
+        record.set(b"long", Some(&cigar), &sequence, &qualities);
+        record.set_tid(0);
+        record.set_pos(0);
+
+        let raw = from_htslib_record(&record).unwrap();
+        assert_eq!(
+            raw.cigar_ops().collect::<Vec<_>>(),
+            [(4, 65_536), (3, 65_536)]
+        );
+        let decoded = raw.decoded_cigar().unwrap();
+        assert_eq!(decoded.len(), 65_536);
+        assert!(decoded.iter().all(|&op| op == (0, 1)));
     }
 }

@@ -333,8 +333,15 @@ fn decoded_cigar_replaces_the_bam_long_cigar_placeholder() {
     let cigar = raw.decoded_cigar().unwrap();
     assert_eq!(cigar.len(), count);
     assert_eq!(cigar.last(), Some(&(0, 1)));
+    let mut buffer = Vec::new();
+    raw.decode_cigar_into(&mut buffer).unwrap();
+    assert_eq!(buffer, cigar);
+    let capacity = buffer.capacity();
     let borrowed = rsomics_bamio::raw::RecordRef::from_bytes(raw.as_bytes()).unwrap();
     assert_eq!(borrowed.decoded_cigar().unwrap(), cigar);
+    borrowed.decode_cigar_into(&mut buffer).unwrap();
+    assert_eq!(buffer, cigar);
+    assert_eq!(buffer.capacity(), capacity);
 }
 
 #[test]

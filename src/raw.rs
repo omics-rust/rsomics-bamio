@@ -88,17 +88,26 @@ fn payload_cigar_ops(bytes: &[u8]) -> impl Iterator<Item = (u8, u32)> + '_ {
 }
 
 fn payload_decoded_cigar(bytes: &[u8], layout: RecordLayout) -> Result<Vec<(u8, u32)>> {
-    let raw = payload_cigar_ops(bytes).collect::<Vec<_>>();
-    let cigar = if raw.len() == 2
-        && raw[0] == (CIGAR_SOFT_CLIP, layout.base_count)
-        && raw[1].0 == CIGAR_REFERENCE_SKIP
+    let mut cigar = Vec::new();
+    payload_decode_cigar_into(bytes, layout, &mut cigar)?;
+    Ok(cigar)
+}
+
+fn payload_decode_cigar_into(
+    bytes: &[u8],
+    layout: RecordLayout,
+    cigar: &mut Vec<(u8, u32)>,
+) -> Result<()> {
+    cigar.clear();
+    cigar.extend(payload_cigar_ops(bytes));
+    if cigar.len() == 2
+        && cigar[0] == (CIGAR_SOFT_CLIP, layout.base_count)
+        && cigar[1].0 == CIGAR_REFERENCE_SKIP
         && payload_aux_type(bytes, layout, *b"CG") == Some(b'B')
     {
-        payload_long_cigar(bytes, layout, raw[1].1)?
-    } else {
-        raw
-    };
-    for &(kind, length) in &cigar {
+        payload_long_cigar_into(bytes, layout, cigar[1].1, cigar)?;
+    }
+    for &(kind, length) in cigar.iter() {
         if kind > 8 {
             return Err(invalid_cigar(
                 bytes,
@@ -112,14 +121,15 @@ fn payload_decoded_cigar(bytes: &[u8], layout: RecordLayout) -> Result<Vec<(u8, 
             ));
         }
     }
-    Ok(cigar)
+    Ok(())
 }
 
-fn payload_long_cigar(
+fn payload_long_cigar_into(
     bytes: &[u8],
     layout: RecordLayout,
     placeholder_span: u32,
-) -> Result<Vec<(u8, u32)>> {
+    cigar: &mut Vec<(u8, u32)>,
+) -> Result<()> {
     let value = payload_aux_value(bytes, layout, *b"CG")
         .ok_or_else(|| invalid_cigar(bytes, "CG long-CIGAR field is absent"))?;
     if value.len() < 5 || value[0] != b'I' {
@@ -150,17 +160,15 @@ fn payload_long_cigar(
             "CG long-CIGAR field has the wrong length",
         ));
     }
-    let cigar = value[5..]
-        .chunks_exact(4)
-        .map(|chunk| {
-            let packed = u32::from_le_bytes(
-                chunk
-                    .try_into()
-                    .expect("long-CIGAR operation has four bytes"),
-            );
-            ((packed & 0x0f) as u8, packed >> 4)
-        })
-        .collect::<Vec<_>>();
+    cigar.clear();
+    cigar.extend(value[5..].chunks_exact(4).map(|chunk| {
+        let packed = u32::from_le_bytes(
+            chunk
+                .try_into()
+                .expect("long-CIGAR operation has four bytes"),
+        );
+        ((packed & 0x0f) as u8, packed >> 4)
+    }));
     let reference_span = cigar
         .iter()
         .filter(|(kind, _)| matches!(kind, 0 | 2 | 3 | 7 | 8))
@@ -174,7 +182,7 @@ fn payload_long_cigar(
             "CG long-CIGAR reference span differs from its placeholder",
         ));
     }
-    Ok(cigar)
+    Ok(())
 }
 
 fn invalid_cigar(bytes: &[u8], reason: impl std::fmt::Display) -> RsomicsError {
@@ -300,6 +308,12 @@ macro_rules! raw_field_accessors {
             /// The decoded BAM CIGAR, including a `CG:B,I` long CIGAR.
             pub fn decoded_cigar(&self) -> Result<Vec<(u8, u32)>> {
                 payload_decoded_cigar(self.payload_bytes(), self.layout())
+            }
+
+            /// Decodes and validates the BAM CIGAR into a reusable caller-owned buffer.
+            /// Existing values are replaced without shrinking the buffer.
+            pub fn decode_cigar_into(&self, cigar: &mut Vec<(u8, u32)>) -> Result<()> {
+                payload_decode_cigar_into(self.payload_bytes(), self.layout(), cigar)
             }
 
             /// The number of query bases.
@@ -849,5 +863,12 @@ mod tests {
         let decoded = raw.decoded_cigar().unwrap();
         assert_eq!(decoded.len(), 65_536);
         assert!(decoded.iter().all(|&op| op == (0, 1)));
+
+        let mut reused = Vec::new();
+        raw.decode_cigar_into(&mut reused).unwrap();
+        let capacity = reused.capacity();
+        raw.decode_cigar_into(&mut reused).unwrap();
+        assert_eq!(reused, decoded);
+        assert_eq!(reused.capacity(), capacity);
     }
 }

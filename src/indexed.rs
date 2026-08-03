@@ -160,12 +160,24 @@ fn set_alternative_index(
 ) -> Result<alignment::io::indexed_reader::Builder> {
     match format {
         Format::Sam => {
-            let appended = append_extension(input, "csi");
-            let alternative = input.with_extension("csi");
-            if !index_exists(input, &appended)? && index_exists(input, &alternative)? {
-                let index = csi::fs::read(&alternative)
-                    .map_err(|error| index_error(input, &alternative, error))?;
+            let appended_bai = append_extension(input, "bai");
+            let appended_csi = append_extension(input, "csi");
+            if index_exists(input, &appended_bai)? {
+                let index = bam::bai::fs::read(&appended_bai)
+                    .map_err(|error| index_error(input, &appended_bai, error))?;
                 builder = builder.set_index(index);
+            } else if !index_exists(input, &appended_csi)? {
+                let alternative_bai = input.with_extension("bai");
+                let alternative_csi = input.with_extension("csi");
+                if index_exists(input, &alternative_bai)? {
+                    let index = bam::bai::fs::read(&alternative_bai)
+                        .map_err(|error| index_error(input, &alternative_bai, error))?;
+                    builder = builder.set_index(index);
+                } else if index_exists(input, &alternative_csi)? {
+                    let index = csi::fs::read(&alternative_csi)
+                        .map_err(|error| index_error(input, &alternative_csi, error))?;
+                    builder = builder.set_index(index);
+                }
             }
         }
         Format::Bam => {
@@ -275,11 +287,60 @@ fn index_error(input: &Path, index: &Path, error: std::io::Error) -> RsomicsErro
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use noodles::core::Region;
+    use noodles::csi::binning_index::Indexer;
+    use noodles::csi::binning_index::index::reference_sequence::bin::Chunk;
+    use noodles::csi::binning_index::index::reference_sequence::index::LinearIndex;
     use noodles::sam;
+    use noodles::sam::alignment::Record as _;
     use noodles::sam::alignment::io::Write as _;
 
     use super::*;
+
+    #[test]
+    fn opens_bgzf_sam_with_an_appended_bai() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("records.sam.gz");
+        let source = b"@HD\tVN:1.6\tSO:coordinate\n\
+                       @SQ\tSN:chr1\tLN:20\n\
+                       read\t0\tchr1\t3\t60\t1M\t*\t0\t0\tA\tI\n";
+        let mut writer = bgzf::io::Writer::new(File::create(&input).unwrap());
+        writer.write_all(source).unwrap();
+        writer.try_finish().unwrap();
+
+        let mut reader = sam::io::Reader::new(bgzf::io::Reader::new(File::open(&input).unwrap()));
+        let header = reader.read_header().unwrap();
+        let mut record = sam::Record::default();
+        let start_offset = reader.get_ref().virtual_position();
+        assert_ne!(reader.read_record(&mut record).unwrap(), 0);
+        let end_offset = reader.get_ref().virtual_position();
+        let mut indexer = Indexer::<LinearIndex>::new(14, 5);
+        indexer
+            .add_record(
+                Some((
+                    record.reference_sequence_id(&header).unwrap().unwrap(),
+                    record.alignment_start().unwrap().unwrap(),
+                    record.alignment_end().unwrap().unwrap(),
+                    true,
+                )),
+                Chunk::new(start_offset, end_offset),
+            )
+            .unwrap();
+        let index = indexer.build(1);
+        bam::bai::fs::write(append_extension(&input, "bai"), &index).unwrap();
+
+        let mut reader = open_indexed_alignment(&input, None).unwrap();
+        let header = reader.read_header().unwrap();
+        let region: Region = "chr1:1-5".parse().unwrap();
+        let records = reader
+            .query(&header, &region)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+    }
 
     #[test]
     fn opens_alternative_bai_and_queries_records() {

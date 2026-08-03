@@ -353,3 +353,14 @@ fn decoded_cigar_rejects_invalid_operations() {
     let record = RawRecord::try_from(payload).unwrap();
     assert!(record.decoded_cigar().is_err());
 }
+
+#[test]
+fn readers_reject_a_zero_block_size() {
+    let data = [0; 4];
+    let mut record = RawRecord::default();
+    assert!(raw::read_record(&mut data.as_slice(), &mut record).is_err());
+
+    let mut input = data.as_slice();
+    let mut reader = RecordReader::new(&mut input);
+    assert!(reader.next().is_err());
+}

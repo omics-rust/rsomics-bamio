@@ -710,7 +710,7 @@ pub fn read_record<R: Read>(reader: &mut R, dst: &mut RawRecord) -> Result<usize
     }
     let block_size = u32::from_le_bytes(size_buf) as usize;
     if block_size == 0 {
-        return Ok(0);
+        return Err(invalid_record("block size is zero"));
     }
     dst.bytes.resize(block_size, 0);
     reader
@@ -773,7 +773,7 @@ impl<'r, R: BufRead> RecordReader<'r, R> {
         }
         let block_size = u32::from_le_bytes(size_buf) as usize;
         if block_size == 0 {
-            return Ok(None);
+            return Err(invalid_record("block size is zero"));
         }
 
         let buffered = self.reader.fill_buf().map_err(RsomicsError::Io)?.len();

@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bamio"
-version = "0.8.3"
+version = "0.8.4"
 description = "Validated alignment records and indexed or parallel I/O for rsomics products"
 edition = "2024"
 rust-version = "1.91"
